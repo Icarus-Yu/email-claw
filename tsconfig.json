@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",                                  /* 指定 ECMAScript 目标版本 */
+    "module": "CommonJS",                                /* 指定生成哪个模块系统代码 */
+    "moduleResolution": "node",                          /* 决定如何处理模块 */
+    "outDir": "./dist",                                  /* 编译后的输出目录 */
+    "esModuleInterop": true,                             /* 允许兼容 CommonJS 和 ES 模块 */
+    "forceConsistentCasingInFileNames": true,            /* 强制区分大小写 (对 Linux/WSL 很重要) */
+    "strict": true,                                      /* 开启所有严格的类型检查 */
+    "skipLibCheck": true                                 /* 跳过第三方库的类型检查，大大加快编译速度 */
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
