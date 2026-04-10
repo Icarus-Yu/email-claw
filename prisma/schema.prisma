@@ -1,13 +1,120 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String           @id @default(uuid())
+  email           String           @unique
+  password        String // Hashed
+  imapHost        String?
+  imapUser        String?
+  imapPassword    String? // Encrypted
+  feishuUserId    String? // Feishu integration
+  telegramId      String? // Alternative integration
+  preferences     Json?            @default("{}")
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  emails          Email[]
+  contacts        Contact[]
+  rules           Rule[]
+  agentLogs       AgentLog[]
+  classifications Classification[]
+}
+
+model Email {
+  id             String          @id @default(uuid())
+  userId         String
+  user           User            @relation(fields: [userId], references: [id])
+  messageId      String // IMAP Message ID
+  uid            Int // IMAP UID
+  from           String
+  to             String
+  cc             String?
+  subject        String
+  body           String          @db.Text
+  html           String?         @db.Text
+  category       String? // work/personal/shopping/marketing/spam/other
+  importance     Int? // 0-10
+  isRead         Boolean         @default(false)
+  isArchived     Boolean         @default(false)
+  receivedAt     DateTime
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  classification Classification?
+
+  @@unique([userId, uid])
+  @@index([userId, receivedAt])
+  @@index([category])
+}
+
+model Classification {
+  id             String   @id @default(uuid())
+  emailId        String   @unique
+  email          Email    @relation(fields: [emailId], references: [id])
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  category       String
+  confidence     Float
+  reasoning      String?  @db.Text
+  toolsUsed      Json? // ["get_sender_info", "check_keywords"]
+  executionSteps Json?
+  model          String
+  cost           Decimal? @db.Decimal(10, 6)
+  feedback       String? // correct/incorrect
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Contact {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  email       String
+  name        String?
+  isImportant Boolean   @default(false)
+  category    String? // colleague/friend/family/vendor
+  emailCount  Int       @default(0)
+  lastEmailAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([userId, email])
+}
+
+model Rule {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  name        String
+  description String?
+  conditions  Json // {field, operator, value}
+  actions     Json // {type, value}
+  priority    Int      @default(0)
+  isEnabled   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model AgentLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  type      String // classification/importance/summarization
+  status    String // success/failure/timeout
+  input     Json?
+  output    Json?
+  error     String?  @db.Text
+  model     String
+  tokens    Json? // {prompt_tokens, completion_tokens}
+  cost      Decimal? @db.Decimal(10, 6)
+  duration  Int // ms
+  createdAt DateTime @default(now())
 }

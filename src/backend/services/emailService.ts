@@ -1,8 +1,28 @@
 import Imap from 'imap';
+import { simpleParser } from 'mailparser';
+import { databaseService } from './databaseService';
 
-// 新增：自动推断 IMAP 配置的辅助函数
+/**
+ * 简化版邮件结构，方便 Agent 处理
+ */
+export interface SimpleEmail {
+  uid: number;
+  messageId: string;
+  subject: string;
+  from: string;
+  to: string;
+  date: Date;
+  text: string;
+  html?: string;
+  attachments: Array<{
+    filename?: string;
+    contentType: string;
+    size: number;
+  }>;
+}
+
+// 自动推断 IMAP 配置的辅助函数
 function resolveImapConfig(email: string, envHost?: string, envPort?: string) {
-  // 1. 如果环境变量中明确指定了 host，优先使用环境变量（保留用户自定义的权利）
   if (envHost) {
     return {
       host: envHost,
@@ -10,39 +30,40 @@ function resolveImapConfig(email: string, envHost?: string, envPort?: string) {
     };
   }
 
-  // 2. 提取邮箱的域名部分并转为小写 (例如 user@qq.com -> qq.com)
   const domain = email.split('@')[1]?.toLowerCase();
 
-  // 3. 根据常见域名匹配对应的 IMAP 服务器地址
   switch (domain) {
     case 'qq.com':
     case 'foxmail.com':
       return { host: 'imap.qq.com', port: 993 };
-    case '163.com': // 考虑到你可能还会用到网易云音乐等网易系产品，顺便加上 163 邮箱支持
-      return { host: 'imap.163.com', port: 993 };
+    case '163.com':
     case '126.com':
-      return { host: 'imap.126.com', port: 993 };
+      return { host: `imap.${domain}`, port: 993 };
     case 'gmail.com':
       return { host: 'imap.gmail.com', port: 993 };
     case 'outlook.com':
     case 'hotmail.com':
       return { host: 'outlook.office365.com', port: 993 };
     default:
-      // 如果不在常见列表内，兜底策略：盲猜格式为 imap.xxx.com（常见于企业邮箱）
       return { host: `imap.${domain}`, port: 993 };
   }
 }
 
 export class EmailService {
   private imap: Imap | null = null;
+  private isConnecting = false;
+  private readonly PROCESSED_FLAG = 'CLAWED'; // 自定义标记，防止重复处理
+  private readonly DEFAULT_USER_ID = 'default-user-id'; // 演示用，实际应从配置或数据库获取
 
   public connect() {
+    if (this.isConnecting) return;
+    this.isConnecting = true;
+
     console.log('🔄 正在加载配置，准备连接 IMAP 服务器...');
 
     const userEmail = process.env.IMAP_USER || '';
     const userPassword = process.env.IMAP_PASSWORD || '';
 
-    // 调用解析函数，自动识别主机和端口
     const imapConfig = resolveImapConfig(userEmail, process.env.IMAP_HOST, process.env.IMAP_PORT);
 
     console.log(`📡 识别到邮箱，目标 IMAP 服务器: ${imapConfig.host}:${imapConfig.port}`);
@@ -52,21 +73,20 @@ export class EmailService {
       password: userPassword,
       host: imapConfig.host,
       port: imapConfig.port,
-      
-      tls: true, // 强制开启 TLS
+      tls: true,
       tlsOptions: { 
         rejectUnauthorized: false,
-        servername: imapConfig.host // 这里也要同步改为动态获取的主机名
+        servername: imapConfig.host 
       }, 
-      
-      authTimeout: 10000, 
-      debug: console.log 
+      authTimeout: 15000, 
+      keepalive: {
+        interval: 10000,
+        idleInterval: 300000,
+        forceNoop: true
+      }
     });
 
-    // 绑定事件
     this.initListeners();
-
-    // 发起连接
     this.imap.connect();
   }
 
@@ -74,50 +94,157 @@ export class EmailService {
     if (!this.imap) return;
 
     this.imap.once('ready', () => {
+      this.isConnecting = false;
       console.log('✅ IMAP 连接成功，鉴权通过！');
       
-      // 下一步：打开 INBOX 文件夹
-      // false 表示以读写模式打开（因为我们后续需要标记已读等操作）
       this.imap?.openBox('INBOX', false, (err, box) => {
         if (err) {
           console.error('❌ 打开 INBOX 失败:', err);
           return;
         }
         
-        console.log(`📂 成功打开 INBOX，当前邮箱共有 ${box.messages.total} 封邮件。`);
-        console.log('🎧 进入 IDLE 模式，开始实时监听新邮件...');
-
-        // 监听新邮件到达事件
-        this.imap?.on('mail', (numNewMsgs: number) => {
-          console.log(`📬 叮！检测到 ${numNewMsgs} 封新邮件到达！`);
-          this.fetchLatestEmails(numNewMsgs);
-        });
+        console.log(`📂 成功打开 INBOX，当前共有 ${box.messages.total} 封邮件。`);
         
-        // 监听邮件被删除/移出事件 (可选，但有助于了解邮箱状态变化)
-        this.imap?.on('expunge', (seqno: number) => {
-          console.log(`🗑️ 序号为 ${seqno} 的邮件已被彻底删除或移出 INBOX。`);
+        // 初次连接时，可以先扫描未标记过的历史邮件
+        this.scanUnprocessedEmails();
+
+        this.imap?.on('mail', (numNewMsgs: number) => {
+          console.log(`📬 检测到 ${numNewMsgs} 封新邮件到达！`);
+          this.fetchLatestEmails();
         });
       });
     });
 
-    this.imap.once('error', (err: Error) => {
-      console.error('❌ IMAP 连接或鉴权失败:', err.message);
+    this.imap.on('error', (err: any) => {
+      this.isConnecting = false;
+      console.error('❌ IMAP 错误:', err.message);
+      this.reconnect();
     });
 
     this.imap.once('end', () => {
-      console.log('⚠️ IMAP 连接已断开');
+      this.isConnecting = false;
+      console.log('⚠️ IMAP 连接已断发，准备重连...');
+      this.reconnect();
     });
   }
-  private fetchLatestEmails(numNewMsgs: number) 
-{
- if (!this.imap)return ;
- //获取最新到达的邮件('*'代表最新的一份,如果是多份可以根据业务需求计算seq范围)
-  const fetch= this.imap.seq.fetch('*',{
-    bodies:''
-  });
-  
-}
 
+  private reconnect() {
+    setTimeout(() => {
+      console.log('🔄 正在尝试重新连接...');
+      this.connect();
+    }, 5000);
+  }
+
+  private scanUnprocessedEmails() {
+    if (!this.imap) return;
+    
+    // 搜索未包含特定标记的邮件
+    this.imap.search(['UNSEEN', ['NOT', ['KEYWORD', this.PROCESSED_FLAG]]], (err, uids) => {
+      if (err) {
+        console.error('❌ 搜索邮件失败:', err);
+        return;
+      }
+      if (uids.length > 0) {
+        console.log(`🔎 发现 ${uids.length} 封待处理的未读邮件。`);
+        this.fetchEmailsByUids(uids);
+      }
+    });
+  }
+
+  private fetchLatestEmails() {
+    setTimeout(() => {
+        this.scanUnprocessedEmails();
+    }, 1000);
+  }
+
+  private fetchEmailsByUids(uids: number[]) {
+    if (!this.imap || uids.length === 0) return;
+
+    const f = this.imap.fetch(uids, { bodies: '', struct: true });
+
+    f.on('message', (msg, seqno) => {
+      let buffer = '';
+      let uid: number;
+
+      msg.on('body', (stream) => {
+        stream.on('data', (chunk) => {
+          buffer += chunk.toString('utf8');
+        });
+      });
+
+      msg.once('attributes', (attrs) => {
+        uid = attrs.uid;
+      });
+
+      msg.once('end', async () => {
+        try {
+          const parsed = await simpleParser(buffer);
+          const simpleEmail: SimpleEmail = {
+            uid,
+            messageId: parsed.messageId || `uid-${uid}`,
+            subject: parsed.subject || '(无主题)',
+            from: parsed.from?.text || 'Unknown',
+            to: Array.isArray(parsed.to) ? parsed.to.map(t => t.text).join(', ') : (parsed.to?.text || 'Unknown'),
+            date: parsed.date || new Date(),
+            text: parsed.text || '',
+            html: parsed.html || undefined,
+            attachments: parsed.attachments.map(a => ({
+              filename: a.filename,
+              contentType: a.contentType,
+              size: a.size
+            }))
+          };
+
+          this.processEmail(simpleEmail);
+        } catch (error) {
+          console.error(`❌ 解析邮件失败 (UID: ${uid}):`, error);
+        }
+      });
+    });
+
+    f.once('error', (err) => {
+      console.error('❌ Fetch 过程中出错:', err);
+    });
+  }
+
+  /**
+   * 核心业务逻辑：保存到数据库并交由 Agent 处理
+   */
+  private async processEmail(email: SimpleEmail) {
+    console.log(`🤖 正在处理邮件: [${email.subject}] 来自 ${email.from}`);
+    
+    try {
+        // 1. 保存到数据库
+        await databaseService.upsertEmail(this.DEFAULT_USER_ID, {
+            uid: email.uid,
+            messageId: email.messageId,
+            from: email.from,
+            to: email.to,
+            subject: email.subject,
+            body: email.text,
+            html: email.html,
+            receivedAt: email.date,
+        });
+
+        console.log(`💾 邮件 UID:${email.uid} 已保存到数据库。`);
+
+        // 2. TODO: 调用 OpenClaw Agent 进行意图识别和信息提取
+        // const result = await openClawAgent.handle(email);
+        
+        // 3. 处理完成后，打上已处理标记
+        this.markAsProcessed(email.uid);
+    } catch (error) {
+        console.error(`❌ 处理邮件失败 (UID: ${email.uid}):`, error);
+    }
+  }
+
+  private markAsProcessed(uid: number) {
+    if (!this.imap) return;
+    this.imap.addFlags(uid, [this.PROCESSED_FLAG], (err) => {
+      if (err) console.error(`❌ 标记邮件 UID:${uid} 失败:`, err);
+      else console.log(`✅ 邮件 UID:${uid} 已成功标记为处理过。`);
+    });
+  }
 }
 
 export const emailService = new EmailService();
