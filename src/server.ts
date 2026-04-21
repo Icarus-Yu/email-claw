@@ -1,8 +1,9 @@
-import express from 'express';
 import dotenv from 'dotenv';
-import { emailService } from './backend/services/emailService';
 // 加载 .env 文件里的机密配置
 dotenv.config();
+
+import express from 'express';
+import { emailService } from './backend/services/emailService';
 
 const app = express();
 app.use(express.json()); // 允许程序解析 JSON 格式的网络请求

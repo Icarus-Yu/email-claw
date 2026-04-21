@@ -138,8 +138,8 @@ export class EmailService {
   private scanUnprocessedEmails() {
     if (!this.imap) return;
     
-    // 搜索未包含特定标记的邮件
-    this.imap.search(['UNSEEN', ['NOT', ['KEYWORD', this.PROCESSED_FLAG]]], (err, uids) => {
+    // 仅搜索未读邮件，之后在代码中过滤已处理过的标记
+    this.imap.search(['UNSEEN'], (err, uids) => {
       if (err) {
         console.error('❌ 搜索邮件失败:', err);
         return;
@@ -160,11 +160,13 @@ export class EmailService {
   private fetchEmailsByUids(uids: number[]) {
     if (!this.imap || uids.length === 0) return;
 
+    // 获取邮件内容和标记
     const f = this.imap.fetch(uids, { bodies: '', struct: true });
 
     f.on('message', (msg, seqno) => {
       let buffer = '';
       let uid: number;
+      let flags: string[] = [];
 
       msg.on('body', (stream) => {
         stream.on('data', (chunk) => {
@@ -174,9 +176,16 @@ export class EmailService {
 
       msg.once('attributes', (attrs) => {
         uid = attrs.uid;
+        flags = attrs.flags || [];
       });
 
       msg.once('end', async () => {
+        // 如果已经包含处理标记，跳过
+        if (flags.includes(this.PROCESSED_FLAG) || flags.includes(`\\${this.PROCESSED_FLAG}`)) {
+            console.log(`⏩ 邮件 UID:${uid} 已有处理标记，跳过。`);
+            return;
+        }
+
         try {
           const parsed = await simpleParser(buffer);
           const simpleEmail: SimpleEmail = {
