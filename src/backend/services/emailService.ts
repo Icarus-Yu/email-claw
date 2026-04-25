@@ -1,5 +1,6 @@
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
+import { agentService } from './agentService';
 import { databaseService } from './databaseService';
 
 /**
@@ -237,8 +238,15 @@ export class EmailService {
 
         console.log(`💾 邮件 UID:${email.uid} 已保存到数据库。`);
 
-        // 2. TODO: 调用 OpenClaw Agent 进行意图识别和信息提取
-        // const result = await openClawAgent.handle(email);
+        // 2. 调用 Agent 进行基础分类、重要性判断和摘要生成
+        const analysis = await agentService.analyzeEmail({
+            userId: this.DEFAULT_USER_ID,
+            email,
+        });
+
+        console.log(
+          `🧠 Agent 分析完成: 分类=${analysis.classification.category}, 重要性=${analysis.importance.score}/10`
+        );
         
         // 3. 处理完成后，打上已处理标记
         this.markAsProcessed(email.uid);

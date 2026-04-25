@@ -1,6 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
+import type { EmailAgentResult } from '../../agents/types/emailAgent';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL
@@ -28,6 +29,83 @@ export class DatabaseService {
         userId,
         ...emailData,
       },
+    });
+  }
+
+  /**
+   * 保存 Agent 对邮件的分析结果
+   */
+  async saveEmailAnalysis(
+    userId: string,
+    uid: number,
+    result: EmailAgentResult & { duration: number }
+  ) {
+    const email = await prisma.email.findUnique({
+      where: {
+        userId_uid: {
+          userId,
+          uid,
+        },
+      },
+    });
+
+    if (!email) {
+      throw new Error(`Email not found for userId=${userId}, uid=${uid}`);
+    }
+
+    await prisma.email.update({
+      where: {
+        id: email.id,
+      },
+      data: {
+        category: result.classification.category,
+        importance: result.importance.score,
+      },
+    });
+
+    await prisma.classification.upsert({
+      where: {
+        emailId: email.id,
+      },
+      update: {
+        category: result.classification.category,
+        confidence: result.classification.confidence,
+        reasoning: [
+          result.classification.reasoning,
+          `重要性: ${result.importance.score}/10，${result.importance.reasoning}`,
+          `摘要: ${result.summary.summary}`,
+        ].join('\n'),
+        toolsUsed: result.classification.toolsUsed,
+        executionSteps: result.classification.executionSteps,
+        model: result.classification.model,
+      },
+      create: {
+        emailId: email.id,
+        userId,
+        category: result.classification.category,
+        confidence: result.classification.confidence,
+        reasoning: [
+          result.classification.reasoning,
+          `重要性: ${result.importance.score}/10，${result.importance.reasoning}`,
+          `摘要: ${result.summary.summary}`,
+        ].join('\n'),
+        toolsUsed: result.classification.toolsUsed,
+        executionSteps: result.classification.executionSteps,
+        model: result.classification.model,
+      },
+    });
+
+    await this.logAgentAction({
+      userId,
+      type: 'classification',
+      status: 'success',
+      input: {
+        emailId: email.id,
+        uid,
+      },
+      output: result,
+      model: result.classification.model,
+      duration: result.duration,
     });
   }
 
