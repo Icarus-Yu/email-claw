@@ -2,6 +2,7 @@ import Imap from 'imap';
 import { simpleParser } from 'mailparser';
 import { agentService } from './agentService';
 import { databaseService } from './databaseService';
+import { feishuService } from '../integrations/feishu/feishuService';
 
 /**
  * 简化版邮件结构，方便 Agent 处理
@@ -222,10 +223,10 @@ export class EmailService {
    */
   private async processEmail(email: SimpleEmail) {
     console.log(`🤖 正在处理邮件: [${email.subject}] 来自 ${email.from}`);
-    
+
     try {
         // 1. 保存到数据库
-        await databaseService.upsertEmail(this.DEFAULT_USER_ID, {
+        const saved = await databaseService.upsertEmail(this.DEFAULT_USER_ID, {
             uid: email.uid,
             messageId: email.messageId,
             from: email.from,
@@ -236,7 +237,7 @@ export class EmailService {
             receivedAt: email.date,
         });
 
-        console.log(`💾 邮件 UID:${email.uid} 已保存到数据库。`);
+        console.log(`💾 邮件 UID:${email.uid} 已保存到数据库 (id=${saved.id})。`);
 
         // 2. 调用 Agent 进行基础分类、重要性判断和摘要生成
         const analysis = await agentService.analyzeEmail({
@@ -247,8 +248,24 @@ export class EmailService {
         console.log(
           `🧠 Agent 分析完成: 分类=${analysis.classification.category}, 重要性=${analysis.importance.score}/10`
         );
-        
-        // 3. 处理完成后，打上已处理标记
+
+        // 3. 推送飞书卡片通知
+        await feishuService.pushEmailCard({
+          emailId: saved.id,
+          from: email.from,
+          to: email.to,
+          subject: email.subject,
+          receivedAt: email.date.toISOString(),
+          category: analysis.classification.category,
+          importance: analysis.importance.score,
+          summary: analysis.summary.summary,
+          classificationReasoning: analysis.classification.reasoning,
+          confidence: analysis.classification.confidence,
+          isRead: false,
+          isArchived: false,
+        });
+
+        // 4. 处理完成后，打上已处理标记
         this.markAsProcessed(email.uid);
     } catch (error) {
         console.error(`❌ 处理邮件失败 (UID: ${email.uid}):`, error);
@@ -261,6 +278,79 @@ export class EmailService {
       if (err) console.error(`❌ 标记邮件 UID:${uid} 失败:`, err);
       else console.log(`✅ 邮件 UID:${uid} 已成功标记为处理过。`);
     });
+  }
+
+  // ========== 飞书回调触发的公开方法 ==========
+
+  async markReadByEmailId(emailId: string) {
+    const uid = await this.getUidByEmailId(emailId);
+    if (uid == null) return;
+    this.imap?.addFlags(uid, ['\\Seen'], (err) => {
+      if (err) console.error(`❌ 标记已读失败 UID:${uid}:`, err);
+      else console.log(`✅ 邮件 UID:${uid} 已标记为已读`);
+    });
+  }
+
+  async markImportantByEmailId(emailId: string) {
+    const uid = await this.getUidByEmailId(emailId);
+    if (uid == null) return;
+    this.imap?.addFlags(uid, ['\\Flagged'], (err) => {
+      if (err) console.error(`❌ 标记重点失败 UID:${uid}:`, err);
+      else console.log(`✅ 邮件 UID:${uid} 已标记为重点`);
+    });
+  }
+
+  async archiveByEmailId(emailId: string) {
+    const uid = await this.getUidByEmailId(emailId);
+    if (uid == null) return;
+    this.imap?.move(uid, 'Archive', (err) => {
+      if (err) console.error(`❌ 归档失败 UID:${uid}:`, err);
+      else console.log(`✅ 邮件 UID:${uid} 已归档`);
+    });
+  }
+
+  async deleteByEmailId(emailId: string) {
+    const uid = await this.getUidByEmailId(emailId);
+    if (uid == null) return;
+    this.imap?.addFlags(uid, ['\\Deleted'], (err) => {
+      if (err) {
+        console.error(`❌ 删除标记失败 UID:${uid}:`, err);
+        return;
+      }
+      this.imap?.expunge(uid, (expungeErr) => {
+        if (expungeErr) console.error(`❌ expunge 失败 UID:${uid}:`, expungeErr);
+        else console.log(`✅ 邮件 UID:${uid} 已删除`);
+      });
+    });
+  }
+
+  async reanalyzeByEmailId(emailId: string) {
+    const email = await databaseService.getEmailById(emailId);
+    if (!email) {
+      console.warn(`⚠️ 找不到邮件 emailId=${emailId}，无法重新分析`);
+      return;
+    }
+    const simpleEmail: SimpleEmail = {
+      uid: email.uid,
+      messageId: email.messageId || emailId,
+      subject: email.subject,
+      from: email.from,
+      to: email.to,
+      date: email.receivedAt,
+      text: email.body,
+      html: email.html || undefined,
+      attachments: [],
+    };
+    await this.processEmail(simpleEmail);
+  }
+
+  private async getUidByEmailId(emailId: string): Promise<number | null> {
+    try {
+      const email = await databaseService.getEmailById(emailId);
+      return email?.uid ?? null;
+    } catch {
+      return null;
+    }
   }
 }
 

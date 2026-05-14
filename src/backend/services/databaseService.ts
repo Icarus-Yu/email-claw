@@ -126,6 +126,58 @@ export class DatabaseService {
       where: { id: userId },
     });
   }
+
+  // ========== 飞书回调触发的操作 ==========
+
+  async markEmailRead(emailId: string) {
+    return prisma.email.update({
+      where: { id: emailId },
+      data: { isRead: true },
+    });
+  }
+
+  async markEmailImportant(emailId: string) {
+    return prisma.email.update({
+      where: { id: emailId },
+      data: { importance: 10 },
+    });
+  }
+
+  async archiveEmail(emailId: string) {
+    return prisma.email.update({
+      where: { id: emailId },
+      data: { isArchived: true },
+    });
+  }
+
+  async markEmailDeleted(emailId: string) {
+    return prisma.email.update({
+      where: { id: emailId },
+      data: { isArchived: true },
+    });
+  }
+
+  async saveClassificationFeedback(
+    emailId: string,
+    feedback: string,
+    expectedCategory?: string,
+    comment?: string
+  ) {
+    return prisma.classification.update({
+      where: { emailId },
+      data: {
+        feedback,
+        ...(expectedCategory ? { category: expectedCategory } : {}),
+        ...(comment ? { reasoning: comment } : {}),
+      },
+    });
+  }
+
+  async getEmailById(emailId: string) {
+    return prisma.email.findUnique({
+      where: { id: emailId },
+    });
+  }
 }
 
 export const databaseService = new DatabaseService();
