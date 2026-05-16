@@ -1,0 +1,3 @@
+ALTER TABLE "Email"
+ADD COLUMN "summary" TEXT,
+ADD COLUMN "isDeleted" BOOLEAN NOT NULL DEFAULT false;

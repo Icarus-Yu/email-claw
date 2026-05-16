@@ -23,6 +23,7 @@ export interface FeishuEmailNotify {
   confidence: number;
   isRead: boolean;
   isArchived: boolean;
+  isDeleted?: boolean;
   openId?: string; // 目标用户 open_id，缺省使用机器人默认用户
 }
 
@@ -33,6 +34,24 @@ export interface FeishuCardCallback {
   expectedCategory?: string;
   comment?: string;
   openId?: string;
+}
+
+export interface FeishuCallbackResult {
+  success: boolean;
+  message: string;
+  action?: string;
+  email?: FeishuEmailNotify;
+  detail?: {
+    subject: string;
+    from: string;
+    to: string;
+    receivedAt: string;
+    body: string;
+    html?: string;
+    category?: string | null;
+    importance?: number | null;
+    summary?: string | null;
+  };
 }
 
 export class FeishuService {
@@ -66,10 +85,7 @@ export class FeishuService {
    *
    * @returns 处理结果描述
    */
-  async handleCallback(callback: FeishuCardCallback): Promise<{
-    success: boolean;
-    message: string;
-  }> {
+  async handleCallback(callback: FeishuCardCallback): Promise<FeishuCallbackResult> {
     const { action, emailId, expectedCategory, comment } = callback;
 
     console.log(`📥 收到飞书回调: action=${action}, emailId=${emailId}`);
@@ -115,48 +131,58 @@ export class FeishuService {
     emailId: string,
     db: any,
     emailSvc: any
-  ): Promise<{ success: boolean; message: string }> {
-    await db.markEmailRead(emailId);
-    try { await emailSvc.markReadByEmailId(emailId); } catch { /* IMAP 操作可选 */ }
-    return { success: true, message: '已标记为已读' };
+  ): Promise<FeishuCallbackResult> {
+    await emailSvc.markReadByEmailId(emailId);
+    const email = await db.markEmailRead(emailId);
+    const fullEmail = await db.getEmailById(email.id);
+    return { success: true, action: 'mark_read', message: '已标记为已读', email: this.toNotifyEmail(fullEmail) };
   }
 
   private async handleMarkImportant(
     emailId: string,
     db: any,
     emailSvc: any
-  ): Promise<{ success: boolean; message: string }> {
-    await db.markEmailImportant(emailId);
-    try { await emailSvc.markImportantByEmailId(emailId); } catch { /* IMAP 操作可选 */ }
-    return { success: true, message: '已标为重点' };
+  ): Promise<FeishuCallbackResult> {
+    await emailSvc.markImportantByEmailId(emailId);
+    const email = await db.markEmailImportant(emailId);
+    const fullEmail = await db.getEmailById(email.id);
+    return { success: true, action: 'mark_important', message: '已标为重点', email: this.toNotifyEmail(fullEmail) };
   }
 
   private async handleArchive(
     emailId: string,
     db: any,
     emailSvc: any
-  ): Promise<{ success: boolean; message: string }> {
-    await db.archiveEmail(emailId);
-    try { await emailSvc.archiveByEmailId(emailId); } catch { /* IMAP 操作可选 */ }
-    return { success: true, message: '已归档' };
+  ): Promise<FeishuCallbackResult> {
+    await emailSvc.archiveByEmailId(emailId);
+    const email = await db.archiveEmail(emailId);
+    const fullEmail = await db.getEmailById(email.id);
+    return { success: true, action: 'archive', message: '已归档', email: this.toNotifyEmail(fullEmail) };
   }
 
   private async handleDelete(
     emailId: string,
     db: any,
     emailSvc: any
-  ): Promise<{ success: boolean; message: string }> {
-    await db.markEmailDeleted(emailId);
-    try { await emailSvc.deleteByEmailId(emailId); } catch { /* IMAP 操作可选 */ }
-    return { success: true, message: '已删除' };
+  ): Promise<FeishuCallbackResult> {
+    await emailSvc.deleteByEmailId(emailId);
+    const email = await db.markEmailDeleted(emailId);
+    const fullEmail = await db.getEmailById(email.id);
+    return { success: true, action: 'delete', message: '已删除', email: this.toNotifyEmail(fullEmail) };
   }
 
   private async handleFeedbackCorrect(
     emailId: string,
     db: any
-  ): Promise<{ success: boolean; message: string }> {
+  ): Promise<FeishuCallbackResult> {
     await db.saveClassificationFeedback(emailId, 'correct');
-    return { success: true, message: '感谢反馈！分类正确已记录' };
+    const email = await db.getEmailById(emailId);
+    return {
+      success: true,
+      action: 'feedback_correct',
+      message: '感谢反馈！分类正确已记录',
+      email: this.toNotifyEmail(email),
+    };
   }
 
   private async handleFeedbackWrong(
@@ -164,33 +190,43 @@ export class FeishuService {
     expectedCategory: string | undefined,
     comment: string | undefined,
     db: any
-  ): Promise<{ success: boolean; message: string }> {
+  ): Promise<FeishuCallbackResult> {
     if (!expectedCategory) {
       return { success: false, message: '请提供期望的分类' };
     }
     await db.saveClassificationFeedback(emailId, 'incorrect', expectedCategory, comment);
-    return { success: true, message: `纠错已记录，正确分类: ${expectedCategory}` };
+    const email = await db.getEmailById(emailId);
+    return {
+      success: true,
+      action: 'feedback_wrong',
+      message: `纠错已记录，正确分类: ${expectedCategory}`,
+      email: this.toNotifyEmail(email),
+    };
   }
 
   private async handleViewDetail(
     emailId: string,
     db: any
-  ): Promise<{ success: boolean; message: string }> {
+  ): Promise<FeishuCallbackResult> {
     const email = await db.getEmailById(emailId);
     if (!email) {
       return { success: false, message: '邮件不存在' };
     }
     return {
       success: true,
-      message: JSON.stringify({
+      action: 'view_detail',
+      message: '详情已获取',
+      detail: {
         subject: email.subject,
         from: email.from,
         to: email.to,
+        receivedAt: email.receivedAt.toISOString(),
         body: email.body?.slice(0, 2000),
         html: email.html?.slice(0, 5000),
         category: email.category,
         importance: email.importance,
-      }),
+        summary: email.summary,
+      },
     };
   }
 
@@ -198,13 +234,44 @@ export class FeishuService {
     emailId: string,
     db: any,
     emailSvc: any
-  ): Promise<{ success: boolean; message: string }> {
+  ): Promise<FeishuCallbackResult> {
     try {
-      await emailSvc.reanalyzeByEmailId(emailId);
-      return { success: true, message: '重新分析已触发' };
-    } catch {
-      return { success: false, message: '重新分析触发失败' };
+      const result = await emailSvc.reanalyzeByEmailId(emailId);
+      return {
+        success: true,
+        action: 'reanalyze',
+        message: '重新分析已完成',
+        email: this.toNotifyEmail(result.email),
+      };
+    } catch (error: any) {
+      return { success: false, message: `重新分析失败: ${error.message}` };
     }
+  }
+
+  private toNotifyEmail(email: any): FeishuEmailNotify {
+    const classification = email?.classification;
+
+    return {
+      emailId: email.id,
+      from: email.from,
+      to: email.to,
+      subject: email.subject,
+      receivedAt: email.receivedAt instanceof Date ? email.receivedAt.toISOString() : email.receivedAt,
+      category: email.category || classification?.category || 'other',
+      importance: email.importance ?? 0,
+      summary: email.summary || this.extractSummary(classification?.reasoning) || '暂无摘要',
+      classificationReasoning: classification?.reasoning || '',
+      confidence: classification?.confidence ?? 0,
+      isRead: email.isRead,
+      isArchived: email.isArchived,
+      isDeleted: email.isDeleted,
+    };
+  }
+
+  private extractSummary(reasoning?: string | null): string | undefined {
+    if (!reasoning) return undefined;
+    const summaryLine = reasoning.split('\n').find((line) => line.startsWith('摘要:'));
+    return summaryLine?.replace(/^摘要:\s*/, '').trim();
   }
 }
 

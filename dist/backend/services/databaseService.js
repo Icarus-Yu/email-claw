@@ -53,6 +53,7 @@ class DatabaseService {
             data: {
                 category: result.classification.category,
                 importance: result.importance.score,
+                summary: result.summary.summary,
             },
         });
         await prisma.classification.upsert({
@@ -114,6 +115,120 @@ class DatabaseService {
         return prisma.user.findUnique({
             where: { id: userId },
         });
+    }
+    // ========== 飞书回调触发的操作 ==========
+    async markEmailRead(emailId) {
+        return prisma.email.update({
+            where: { id: emailId },
+            data: { isRead: true },
+        });
+    }
+    async markEmailImportant(emailId) {
+        return prisma.email.update({
+            where: { id: emailId },
+            data: { importance: 10 },
+        });
+    }
+    async archiveEmail(emailId) {
+        return prisma.email.update({
+            where: { id: emailId },
+            data: { isArchived: true },
+        });
+    }
+    async markEmailDeleted(emailId) {
+        return prisma.email.update({
+            where: { id: emailId },
+            data: { isDeleted: true, isArchived: true },
+        });
+    }
+    async saveClassificationFeedback(emailId, feedback, expectedCategory, comment) {
+        const email = await prisma.email.findUnique({
+            where: { id: emailId },
+            select: { userId: true },
+        });
+        if (!email) {
+            throw new Error(`Email not found: ${emailId}`);
+        }
+        if (expectedCategory) {
+            await prisma.email.update({
+                where: { id: emailId },
+                data: { category: expectedCategory },
+            });
+        }
+        return prisma.classification.upsert({
+            where: { emailId },
+            update: {
+                feedback,
+                ...(expectedCategory ? { category: expectedCategory } : {}),
+                ...(comment ? { reasoning: comment } : {}),
+            },
+            create: {
+                emailId,
+                userId: email.userId,
+                category: expectedCategory || 'other',
+                confidence: 1,
+                reasoning: comment || `用户反馈: ${feedback}`,
+                toolsUsed: ['user_feedback'],
+                executionSteps: ['Record classification feedback from Feishu card'],
+                model: 'user-feedback',
+                feedback,
+            },
+        });
+    }
+    async getEmailById(emailId) {
+        return prisma.email.findUnique({
+            where: { id: emailId },
+            include: { classification: true },
+        });
+    }
+    async updateEmailAnalysisById(emailId, userId, result) {
+        await prisma.email.update({
+            where: { id: emailId },
+            data: {
+                category: result.classification.category,
+                importance: result.importance.score,
+                summary: result.summary.summary,
+            },
+        });
+        await prisma.classification.upsert({
+            where: { emailId },
+            update: {
+                category: result.classification.category,
+                confidence: result.classification.confidence,
+                reasoning: [
+                    result.classification.reasoning,
+                    `重要性: ${result.importance.score}/10，${result.importance.reasoning}`,
+                    `摘要: ${result.summary.summary}`,
+                ].join('\n'),
+                toolsUsed: result.classification.toolsUsed,
+                executionSteps: result.classification.executionSteps,
+                model: result.classification.model,
+            },
+            create: {
+                emailId,
+                userId,
+                category: result.classification.category,
+                confidence: result.classification.confidence,
+                reasoning: [
+                    result.classification.reasoning,
+                    `重要性: ${result.importance.score}/10，${result.importance.reasoning}`,
+                    `摘要: ${result.summary.summary}`,
+                ].join('\n'),
+                toolsUsed: result.classification.toolsUsed,
+                executionSteps: result.classification.executionSteps,
+                model: result.classification.model,
+            },
+        });
+        await this.logAgentAction({
+            userId,
+            type: 'reanalyze',
+            status: 'success',
+            input: { emailId },
+            output: result,
+            model: result.classification.model,
+            duration: result.duration,
+        });
+        return this.getEmailById(emailId);
     }
 }
 exports.DatabaseService = DatabaseService;

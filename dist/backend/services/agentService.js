@@ -8,7 +8,7 @@ class AgentService {
     classificationSkill = new classificationSkill_1.ClassificationSkill();
     async analyzeEmail(input) {
         const startedAt = Date.now();
-        const analysis = await this.runAnalysis(input);
+        const analysis = await this.analyzeEmailDraft(input);
         const duration = Date.now() - startedAt;
         await databaseService_1.databaseService.saveEmailAnalysis(input.userId, input.email.uid, {
             ...analysis,
@@ -16,7 +16,7 @@ class AgentService {
         });
         return analysis;
     }
-    async runAnalysis(input) {
+    async analyzeEmailDraft(input) {
         if (openClawClient_1.openClawClient.isEnabled()) {
             try {
                 return await openClawClient_1.openClawClient.analyzeEmail(input.email);

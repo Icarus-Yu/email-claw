@@ -56,6 +56,7 @@ export class EmailService {
   private isConnecting = false;
   private readonly PROCESSED_FLAG = 'CLAWED'; // 自定义标记，防止重复处理
   private readonly DEFAULT_USER_ID = 'default-user-id'; // 演示用，实际应从配置或数据库获取
+  private readonly ARCHIVE_BOX = process.env.IMAP_ARCHIVE_BOX || 'Archive';
 
   public connect() {
     if (this.isConnecting) return;
@@ -283,53 +284,46 @@ export class EmailService {
   // ========== 飞书回调触发的公开方法 ==========
 
   async markReadByEmailId(emailId: string) {
-    const uid = await this.getUidByEmailId(emailId);
-    if (uid == null) return;
-    this.imap?.addFlags(uid, ['\\Seen'], (err) => {
-      if (err) console.error(`❌ 标记已读失败 UID:${uid}:`, err);
-      else console.log(`✅ 邮件 UID:${uid} 已标记为已读`);
+    const uid = await this.getUidByEmailIdOrThrow(emailId);
+    await this.runImapOperation((imap, done) => {
+      imap.addFlags(uid, ['\\Seen'], done);
     });
+    console.log(`✅ 邮件 UID:${uid} 已标记为已读`);
   }
 
   async markImportantByEmailId(emailId: string) {
-    const uid = await this.getUidByEmailId(emailId);
-    if (uid == null) return;
-    this.imap?.addFlags(uid, ['\\Flagged'], (err) => {
-      if (err) console.error(`❌ 标记重点失败 UID:${uid}:`, err);
-      else console.log(`✅ 邮件 UID:${uid} 已标记为重点`);
+    const uid = await this.getUidByEmailIdOrThrow(emailId);
+    await this.runImapOperation((imap, done) => {
+      imap.addFlags(uid, ['\\Flagged'], done);
     });
+    console.log(`✅ 邮件 UID:${uid} 已标记为重点`);
   }
 
   async archiveByEmailId(emailId: string) {
-    const uid = await this.getUidByEmailId(emailId);
-    if (uid == null) return;
-    this.imap?.move(uid, 'Archive', (err) => {
-      if (err) console.error(`❌ 归档失败 UID:${uid}:`, err);
-      else console.log(`✅ 邮件 UID:${uid} 已归档`);
+    const uid = await this.getUidByEmailIdOrThrow(emailId);
+    await this.runImapOperation((imap, done) => {
+      imap.move(uid, this.ARCHIVE_BOX, done);
     });
+    console.log(`✅ 邮件 UID:${uid} 已归档到 ${this.ARCHIVE_BOX}`);
   }
 
   async deleteByEmailId(emailId: string) {
-    const uid = await this.getUidByEmailId(emailId);
-    if (uid == null) return;
-    this.imap?.addFlags(uid, ['\\Deleted'], (err) => {
-      if (err) {
-        console.error(`❌ 删除标记失败 UID:${uid}:`, err);
-        return;
-      }
-      this.imap?.expunge(uid, (expungeErr) => {
-        if (expungeErr) console.error(`❌ expunge 失败 UID:${uid}:`, expungeErr);
-        else console.log(`✅ 邮件 UID:${uid} 已删除`);
-      });
+    const uid = await this.getUidByEmailIdOrThrow(emailId);
+    await this.runImapOperation((imap, done) => {
+      imap.addFlags(uid, ['\\Deleted'], done);
     });
+    await this.runImapOperation((imap, done) => {
+      imap.expunge(uid, done);
+    });
+    console.log(`✅ 邮件 UID:${uid} 已删除`);
   }
 
   async reanalyzeByEmailId(emailId: string) {
     const email = await databaseService.getEmailById(emailId);
     if (!email) {
-      console.warn(`⚠️ 找不到邮件 emailId=${emailId}，无法重新分析`);
-      return;
+      throw new Error(`找不到邮件 emailId=${emailId}，无法重新分析`);
     }
+
     const simpleEmail: SimpleEmail = {
       uid: email.uid,
       messageId: email.messageId || emailId,
@@ -341,16 +335,44 @@ export class EmailService {
       html: email.html || undefined,
       attachments: [],
     };
-    await this.processEmail(simpleEmail);
+
+    const startedAt = Date.now();
+    const analysis = await agentService.analyzeEmailDraft({
+      userId: email.userId,
+      email: simpleEmail,
+    });
+    const duration = Date.now() - startedAt;
+
+    const updatedEmail = await databaseService.updateEmailAnalysisById(emailId, email.userId, {
+      ...analysis,
+      duration,
+    });
+
+    return { analysis, email: updatedEmail };
   }
 
-  private async getUidByEmailId(emailId: string): Promise<number | null> {
-    try {
-      const email = await databaseService.getEmailById(emailId);
-      return email?.uid ?? null;
-    } catch {
-      return null;
+  private async runImapOperation(
+    operation: (imap: Imap, done: (err?: Error | null) => void) => void
+  ): Promise<void> {
+    if (!this.imap) {
+      throw new Error('IMAP 未连接，无法执行邮箱操作');
     }
+
+    await new Promise<void>((resolve, reject) => {
+      operation(this.imap as Imap, (err?: Error | null) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+
+  private async getUidByEmailIdOrThrow(emailId: string): Promise<number> {
+    const email = await databaseService.getEmailById(emailId);
+    if (!email) {
+      throw new Error(`找不到邮件 emailId=${emailId}`);
+    }
+
+    return email.uid;
   }
 }
 

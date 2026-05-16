@@ -33,6 +33,7 @@ const CATEGORY_LABELS = {
 function buildEmailCard(email) {
   const color = CATEGORY_COLORS[email.category] || 'grey';
   const categoryLabel = CATEGORY_LABELS[email.category] || email.category;
+  const canOperate = !email.isDeleted;
 
   return {
     config: { wide_screen_mode: true },
@@ -113,82 +114,13 @@ function buildEmailCard(email) {
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `状态: ${email.isRead ? '✅ 已读' : '📬 未读'} | ${email.isArchived ? '📦 已归档' : '📂 收件箱'}`,
+          content: `状态: ${buildStatusText(email)}`,
         },
       },
       { tag: 'hr' },
 
       // --- 操作按钮区域 ---
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'lark_md', content: '📖 标为已读' },
-            type: 'primary',
-            value: { action: 'mark_read', emailId: email.emailId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'lark_md', content: '⭐ 标为重点' },
-            type: 'default',
-            value: { action: 'mark_important', emailId: email.emailId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'lark_md', content: '📦 归档' },
-            type: 'default',
-            value: { action: 'archive', emailId: email.emailId },
-          },
-        ],
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'lark_md', content: '✅ 分类正确' },
-            type: 'default',
-            value: { action: 'feedback_correct', emailId: email.emailId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'lark_md', content: '❌ 分类错误' },
-            type: 'danger',
-            value: { action: 'feedback_wrong', emailId: email.emailId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'lark_md', content: '🔍 查看详情' },
-            type: 'default',
-            value: { action: 'view_detail', emailId: email.emailId },
-          },
-        ],
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'lark_md', content: '🗑 删除' },
-            type: 'danger',
-            value: { action: 'delete', emailId: email.emailId },
-            confirm: {
-              title: { tag: 'plain_text', content: '确认删除' },
-              text: {
-                tag: 'lark_md',
-                content: '该操作将从邮箱中真实删除此邮件，不可恢复。确定继续？',
-              },
-            },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'lark_md', content: '🔄 重新分析' },
-            type: 'default',
-            value: { action: 'reanalyze', emailId: email.emailId },
-          },
-        ],
-      },
+      ...(canOperate ? buildActionElements(email) : []),
 
       // --- 底部备注 ---
       { tag: 'hr' },
@@ -203,6 +135,86 @@ function buildEmailCard(email) {
       },
     ],
   };
+}
+
+function buildActionElements(email) {
+  return [
+    {
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'lark_md', content: '📖 标为已读' },
+          type: 'primary',
+          value: { action: 'mark_read', emailId: email.emailId },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'lark_md', content: '⭐ 标为重点' },
+          type: 'default',
+          value: { action: 'mark_important', emailId: email.emailId },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'lark_md', content: '📦 归档' },
+          type: 'default',
+          value: { action: 'archive', emailId: email.emailId },
+        },
+      ],
+    },
+    {
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'lark_md', content: '✅ 分类正确' },
+          type: 'default',
+          value: { action: 'feedback_correct', emailId: email.emailId },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'lark_md', content: '❌ 分类错误' },
+          type: 'danger',
+          value: { action: 'feedback_wrong', emailId: email.emailId },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'lark_md', content: '🔍 查看详情' },
+          type: 'default',
+          value: { action: 'view_detail', emailId: email.emailId },
+        },
+      ],
+    },
+    {
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'lark_md', content: '🗑 删除' },
+          type: 'danger',
+          value: { action: 'delete', emailId: email.emailId },
+          confirm: {
+            title: { tag: 'plain_text', content: '确认删除' },
+            text: {
+              tag: 'lark_md',
+              content: '该操作将从邮箱中真实删除此邮件，不可恢复。确定继续？',
+            },
+          },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'lark_md', content: '🔄 重新分析' },
+          type: 'default',
+          value: { action: 'reanalyze', emailId: email.emailId },
+        },
+      ],
+    },
+  ];
+}
+
+function buildStatusText(email) {
+  if (email.isDeleted) return '🗑 已删除';
+  return `${email.isRead ? '✅ 已读' : '📬 未读'} | ${email.isArchived ? '📦 已归档' : '📂 收件箱'}`;
 }
 
 /**
@@ -313,6 +325,68 @@ function buildActionResultCard(action, result, emailSubject) {
   };
 }
 
+function buildEmailDetailCard(detail) {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: detail.subject || '(无主题)' },
+      template: 'blue',
+    },
+    elements: [
+      {
+        tag: 'div',
+        fields: [
+          {
+            is_short: true,
+            text: { tag: 'lark_md', content: `**发件人**\n${escapeMd(detail.from)}` },
+          },
+          {
+            is_short: true,
+            text: { tag: 'lark_md', content: `**收件人**\n${escapeMd(detail.to)}` },
+          },
+        ],
+      },
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: `**时间** ${formatTime(detail.receivedAt)}` },
+      },
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `**分类** ${CATEGORY_LABELS[detail.category] || detail.category || '其他'} | **重要性** ${detail.importance ?? 0}/10`,
+        },
+      },
+      ...(detail.summary
+        ? [
+            {
+              tag: 'div',
+              text: { tag: 'lark_md', content: `**摘要**\n${escapeMd(detail.summary)}` },
+            },
+          ]
+        : []),
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `**正文预览**\n${escapeMd(detail.body || '暂无正文')}`,
+        },
+      },
+      { tag: 'hr' },
+      {
+        tag: 'note',
+        elements: [
+          {
+            tag: 'plain_text',
+            content: `EmailClaw · ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
+          },
+        ],
+      },
+    ],
+  };
+}
+
 // --- 辅助函数 ---
 
 /**
@@ -358,4 +432,5 @@ module.exports = {
   buildEmailCard,
   buildCategoryPickerCard,
   buildActionResultCard,
+  buildEmailDetailCard,
 };

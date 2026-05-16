@@ -251,6 +251,7 @@ vendor/
 Homestead.json
 Homestead.yaml
 *.sql
+!prisma/migrations/**/*.sql
 
 ## Ruby
 *.gem

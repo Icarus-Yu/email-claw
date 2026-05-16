@@ -8,7 +8,7 @@ export class AgentService {
 
   async analyzeEmail(input: EmailAnalysisInput): Promise<EmailAgentResult> {
     const startedAt = Date.now();
-    const analysis = await this.runAnalysis(input);
+    const analysis = await this.analyzeEmailDraft(input);
     const duration = Date.now() - startedAt;
 
     await databaseService.saveEmailAnalysis(input.userId, input.email.uid, {
@@ -19,7 +19,7 @@ export class AgentService {
     return analysis;
   }
 
-  private async runAnalysis(input: EmailAnalysisInput): Promise<EmailAgentResult> {
+  async analyzeEmailDraft(input: EmailAnalysisInput): Promise<EmailAgentResult> {
     if (openClawClient.isEnabled()) {
       try {
         return await openClawClient.analyzeEmail(input.email);
