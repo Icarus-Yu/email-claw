@@ -23,18 +23,30 @@ router.post('/webhook', async (req: Request, res: Response) => {
       });
     }
 
-    const result = await feishuService.handleCallback({
+    // ⭐ 关键改变 1：立刻响应飞书！
+    // 只要参数没问题，立刻给飞书返回 200 和一个空对象。
+    // 这句话执行后，飞书的倒计时就停止了，卡片再也不会报红色的错误！
+    res.status(200).json({});
+
+    // ⭐ 关键改变 2：拿掉 await，放入后台执行
+    // 让 feishuService 自己在后台慢慢连邮箱、改数据库
+    feishuService.handleCallback({
       action,
       emailId,
       expectedCategory,
       comment,
+    })
+    .then((result) => {
+      // 这里的逻辑会在 3~4 秒后执行完毕，我们只需在终端打印一下结果即可
+      if (result.success) {
+        console.log(`✅ 后台执行完毕: ${action} 操作成功`);
+      } else {
+        console.warn(`⚠️ 后台执行提示: ${result.message}`);
+      }
+    })
+    .catch((error: any) => {
+      console.error('❌ 飞书回调后台处理崩溃:', error);
     });
-
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
   } catch (error: any) {
     console.error('❌ 飞书 webhook 处理失败:', error);
     res.status(500).json({
