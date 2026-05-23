@@ -264,6 +264,176 @@ export class DatabaseService {
 
     return this.getEmailById(emailId);
   }
+
+  // ========== 用户与认证 ==========
+
+  async createUser(data: {
+    email: string;
+    passwordHash: string;
+  }) {
+    return prisma.user.create({
+      data: { email: data.email, password: data.passwordHash },
+    });
+  }
+
+  async getUserByEmail(email: string) {
+    return prisma.user.findUnique({ where: { email } });
+  }
+
+  async getUserByFeishuOpenId(openId: string) {
+    return prisma.user.findFirst({ where: { feishuUserId: openId } });
+  }
+
+  async updateUser(userId: string, data: any) {
+    return prisma.user.update({ where: { id: userId }, data });
+  }
+
+  async listUsersWithMailbox() {
+    return prisma.user.findMany({
+      where: {
+        imapHost: { not: null },
+        imapUser: { not: null },
+        imapPassword: { not: null },
+      },
+    });
+  }
+
+  // ========== 规则 ==========
+
+  async listRules(userId: string) {
+    return prisma.rule.findMany({
+      where: { userId },
+      orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
+    });
+  }
+
+  async listEnabledRules(userId: string) {
+    return prisma.rule.findMany({
+      where: { userId, isEnabled: true },
+      orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
+    });
+  }
+
+  async createRule(userId: string, data: any) {
+    return prisma.rule.create({
+      data: {
+        userId,
+        name: data.name,
+        description: data.description,
+        conditions: data.conditions,
+        actions: data.actions,
+        priority: data.priority ?? 0,
+        isEnabled: data.isEnabled ?? true,
+      },
+    });
+  }
+
+  async updateRule(userId: string, ruleId: string, data: any) {
+    // 防御性：必须命中本人
+    const result = await prisma.rule.updateMany({
+      where: { id: ruleId, userId },
+      data,
+    });
+    if (result.count === 0) {
+      throw new Error('规则不存在或无权限');
+    }
+    return prisma.rule.findUnique({ where: { id: ruleId } });
+  }
+
+  async deleteRule(userId: string, ruleId: string) {
+    const result = await prisma.rule.deleteMany({ where: { id: ruleId, userId } });
+    if (result.count === 0) {
+      throw new Error('规则不存在或无权限');
+    }
+  }
+
+  // ========== 邮件搜索 ==========
+
+  async searchEmails(userId: string, filters: {
+    category?: string;
+    sender?: string;
+    dateFrom?: Date;
+    dateTo?: Date;
+    importanceMin?: number;
+    importanceMax?: number;
+    q?: string;
+    isRead?: boolean;
+    isArchived?: boolean;
+    isDeleted?: boolean;
+    page?: number;
+    pageSize?: number;
+  }) {
+    const page = Math.max(1, filters.page || 1);
+    const pageSize = Math.min(100, Math.max(1, filters.pageSize || 20));
+
+    const where: any = { userId };
+    if (filters.category) where.category = filters.category;
+    if (filters.sender) where.from = { contains: filters.sender, mode: 'insensitive' };
+    if (filters.dateFrom || filters.dateTo) {
+      where.receivedAt = {};
+      if (filters.dateFrom) where.receivedAt.gte = filters.dateFrom;
+      if (filters.dateTo) where.receivedAt.lte = filters.dateTo;
+    }
+    if (filters.importanceMin !== undefined || filters.importanceMax !== undefined) {
+      where.importance = {};
+      if (filters.importanceMin !== undefined) where.importance.gte = filters.importanceMin;
+      if (filters.importanceMax !== undefined) where.importance.lte = filters.importanceMax;
+    }
+    if (filters.isRead !== undefined) where.isRead = filters.isRead;
+    if (filters.isArchived !== undefined) where.isArchived = filters.isArchived;
+    if (filters.isDeleted !== undefined) where.isDeleted = filters.isDeleted;
+    if (filters.q) {
+      where.OR = [
+        { subject: { contains: filters.q, mode: 'insensitive' } },
+        { from: { contains: filters.q, mode: 'insensitive' } },
+        { body: { contains: filters.q, mode: 'insensitive' } },
+      ];
+    }
+
+    const [items, total] = await Promise.all([
+      prisma.email.findMany({
+        where,
+        orderBy: { receivedAt: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        select: {
+          id: true,
+          from: true,
+          to: true,
+          subject: true,
+          category: true,
+          importance: true,
+          summary: true,
+          isRead: true,
+          isArchived: true,
+          isDeleted: true,
+          receivedAt: true,
+        },
+      }),
+      prisma.email.count({ where }),
+    ]);
+
+    return { items, total, page, pageSize, totalPages: Math.ceil(total / pageSize) };
+  }
+
+  /** 防御性：校验某封邮件属于某用户 */
+  async assertEmailOwnership(emailId: string, userId: string) {
+    const email = await prisma.email.findUnique({
+      where: { id: emailId },
+      select: { userId: true },
+    });
+    if (!email) {
+      throw new Error('邮件不存在');
+    }
+    if (email.userId !== userId) {
+      throw new Error('无权操作此邮件');
+    }
+  }
+
+  /** 用于联系人维护（鉴权用） */
+  prisma() {
+    return prisma;
+  }
 }
 
 export const databaseService = new DatabaseService();

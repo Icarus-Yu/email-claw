@@ -1,26 +1,60 @@
 import dotenv from 'dotenv';
-// 加载 .env 文件里的机密配置
 dotenv.config();
 
 import express from 'express';
 import { emailService } from './backend/services/emailService';
+import { runBootstrap } from './backend/services/bootstrap';
 import feishuRoutes from './backend/api/routes/feishuRoutes';
+import authRoutes from './backend/api/routes/authRoutes';
+import userRoutes from './backend/api/routes/userRoutes';
+import emailRoutes from './backend/api/routes/emailRoutes';
+import ruleRoutes from './backend/api/routes/ruleRoutes';
 
 const app = express();
-app.use(express.json()); // 允许程序解析 JSON 格式的网络请求
+app.use(express.json({ limit: '2mb' }));
 
 const PORT = process.env.PORT || 3000;
 
-app.get('/ping', (req, res) => {
-  res.json({ message: '🏓 EmailClaw 服务器已启动，随时准备接管邮件！' });
+app.get('/ping', (_req, res) => {
+  res.json({ message: '🏓 EmailClaw 已启动' });
 });
 
-// 飞书卡片按钮回调路由
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/emails', emailRoutes);
+app.use('/api/rules', ruleRoutes);
 app.use('/api/feishu', feishuRoutes);
 
-app.listen(PORT, () => {
-  console.log(`🚀 服务正在运行: http://localhost:${PORT}`);
+async function start() {
+  // 启动前自检：必填环境
+  if (!process.env.JWT_SECRET) {
+    console.warn('⚠️ JWT_SECRET 未配置，认证 API 将无法使用');
+  }
+  if (!process.env.ENCRYPTION_KEY) {
+    console.warn('⚠️ ENCRYPTION_KEY 未配置，绑定邮箱将失败');
+  }
+  if (!process.env.FEISHU_BOT_SHARED_SECRET && process.env.NODE_ENV === 'production') {
+    console.warn('⚠️ FEISHU_BOT_SHARED_SECRET 未配置（生产环境必填）');
+  }
 
-  // 服务器启动后，立刻触发 IMAP 鉴权与连接测试
-  emailService.connect();
+  app.listen(PORT, () => {
+    console.log(`🚀 EmailClaw 后端: http://localhost:${PORT}`);
+  });
+
+  try {
+    await runBootstrap();
+  } catch (e: any) {
+    console.error('❌ Bootstrap 失败:', e.message);
+  }
+
+  try {
+    await emailService.start();
+  } catch (e: any) {
+    console.error('❌ ImapManager 启动失败:', e.message);
+  }
+}
+
+start().catch((e) => {
+  console.error('❌ 启动失败:', e);
+  process.exit(1);
 });

@@ -1,263 +1,97 @@
-import Imap from 'imap';
-import { simpleParser } from 'mailparser';
+/**
+ * 邮件服务 facade
+ *
+ * 重构后：
+ *   - 不再自己管理 IMAP 连接，全部交给 ImapManager
+ *   - 对外暴露 markRead / markImportant / archive / delete / reanalyze
+ *     这些原本的方法签名保持不变，但内部按 emailId → userId → 该用户的 UserMailbox 路由
+ *   - 新邮件 pipeline（processIncomingEmail）注册给 imapManager
+ *
+ * 防御性：每个写操作都强制 ownership 校验，避免飞书回调中传入的 emailId 越权。
+ */
+
 import { agentService } from './agentService';
 import { databaseService } from './databaseService';
 import { feishuService } from '../integrations/feishu/feishuService';
+import { imapManager } from './imapManager';
+import { ruleEngine } from './ruleEngine';
+import type { SimpleEmail } from './userMailbox';
 
-/**
- * 简化版邮件结构，方便 Agent 处理
- */
-export interface SimpleEmail {
-  uid: number;
-  messageId: string;
-  subject: string;
-  from: string;
-  to: string;
-  date: Date;
-  text: string;
-  html?: string;
-  attachments: Array<{
-    filename?: string;
-    contentType: string;
-    size: number;
-  }>;
-}
+export type { SimpleEmail } from './userMailbox';
 
-// 自动推断 IMAP 配置的辅助函数
-function resolveImapConfig(email: string, envHost?: string, envPort?: string) {
-  if (envHost) {
-    return {
-      host: envHost,
-      port: envPort ? parseInt(envPort, 10) : 993
-    };
-  }
-
-  const domain = email.split('@')[1]?.toLowerCase();
-
-  switch (domain) {
-    case 'qq.com':
-    case 'foxmail.com':
-      return { host: 'imap.qq.com', port: 993 };
-    case '163.com':
-    case '126.com':
-      return { host: `imap.${domain}`, port: 993 };
-    case 'gmail.com':
-      return { host: 'imap.gmail.com', port: 993 };
-    case 'outlook.com':
-    case 'hotmail.com':
-      return { host: 'outlook.office365.com', port: 993 };
-    default:
-      return { host: `imap.${domain}`, port: 993 };
-  }
-}
+const DEFAULT_IMPORTANCE_THRESHOLD = 7;
 
 export class EmailService {
-  private imap: Imap | null = null;
-  private isConnecting = false;
-  private readonly PROCESSED_FLAG = 'CLAWED'; // 自定义标记，防止重复处理
-  private readonly DEFAULT_USER_ID = 'default-user-id'; // 演示用，实际应从配置或数据库获取
-  private readonly ARCHIVE_BOX = process.env.IMAP_ARCHIVE_BOX || 'Archive';
-
-  public connect() {
-    if (this.isConnecting) return;
-    this.isConnecting = true;
-
-    console.log('🔄 正在加载配置，准备连接 IMAP 服务器...');
-
-    const userEmail = process.env.IMAP_USER || '';
-    const userPassword = process.env.IMAP_PASSWORD || '';
-
-    const imapConfig = resolveImapConfig(userEmail, process.env.IMAP_HOST, process.env.IMAP_PORT);
-
-    console.log(`📡 识别到邮箱，目标 IMAP 服务器: ${imapConfig.host}:${imapConfig.port}`);
-
-    this.imap = new Imap({
-      user: userEmail,
-      password: userPassword,
-      host: imapConfig.host,
-      port: imapConfig.port,
-      tls: true,
-      tlsOptions: { 
-        rejectUnauthorized: false,
-        servername: imapConfig.host 
-      }, 
-      authTimeout: 15000, 
-      keepalive: {
-        interval: 10000,
-        idleInterval: 300000,
-        forceNoop: true
-      }
-    });
-
-    this.initListeners();
-    this.imap.connect();
-  }
-
-  private initListeners() {
-    if (!this.imap) return;
-
-    this.imap.once('ready', async () => {
-      this.isConnecting = false;
-      console.log('✅ IMAP 连接成功，鉴权通过！');
-
-      // 确保归档文件夹存在（CREATE 命令必须在 selected 状态之前执行）
-      try {
-        await this.ensureArchiveBox();
-      } catch (err: any) {
-        console.error('⚠️ 归档文件夹检查失败:', err.message);
-      }
-
-      this.imap?.openBox('INBOX', false, (err, box) => {
-        if (err) {
-          console.error('❌ 打开 INBOX 失败:', err);
-          return;
-        }
-
-        console.log(`📂 成功打开 INBOX，当前共有 ${box.messages.total} 封邮件。`);
-
-        // 初次连接时，可以先扫描未标记过的历史邮件
-        this.scanUnprocessedEmails();
-
-        this.imap?.on('mail', (numNewMsgs: number) => {
-          console.log(`📬 检测到 ${numNewMsgs} 封新邮件到达！`);
-          this.fetchLatestEmails();
-        });
-      });
-    });
-
-    this.imap.on('error', (err: any) => {
-      this.isConnecting = false;
-      console.error('❌ IMAP 错误:', err.message);
-      this.reconnect();
-    });
-
-    this.imap.once('end', () => {
-      this.isConnecting = false;
-      console.log('⚠️ IMAP 连接已断发，准备重连...');
-      this.reconnect();
-    });
-  }
-
-  private reconnect() {
-    setTimeout(() => {
-      console.log('🔄 正在尝试重新连接...');
-      this.connect();
-    }, 5000);
-  }
-
-  private scanUnprocessedEmails() {
-    if (!this.imap) return;
-    
-    // 仅搜索未读邮件，之后在代码中过滤已处理过的标记
-    this.imap.search(['UNSEEN'], (err, uids) => {
-      if (err) {
-        console.error('❌ 搜索邮件失败:', err);
-        return;
-      }
-      if (uids.length > 0) {
-        console.log(`🔎 发现 ${uids.length} 封待处理的未读邮件。`);
-        this.fetchEmailsByUids(uids);
-      }
-    });
-  }
-
-  private fetchLatestEmails() {
-    setTimeout(() => {
-        this.scanUnprocessedEmails();
-    }, 1000);
-  }
-
-  private fetchEmailsByUids(uids: number[]) {
-    if (!this.imap || uids.length === 0) return;
-
-    // 获取邮件内容和标记
-    const f = this.imap.fetch(uids, { bodies: '', struct: true });
-
-    f.on('message', (msg, seqno) => {
-      let buffer = '';
-      let uid: number;
-      let flags: string[] = [];
-
-      msg.on('body', (stream) => {
-        stream.on('data', (chunk) => {
-          buffer += chunk.toString('utf8');
-        });
-      });
-
-      msg.once('attributes', (attrs) => {
-        uid = attrs.uid;
-        flags = attrs.flags || [];
-      });
-
-      msg.once('end', async () => {
-        // 如果已经包含处理标记，跳过
-        if (flags.includes(this.PROCESSED_FLAG) || flags.includes(`\\${this.PROCESSED_FLAG}`)) {
-            console.log(`⏩ 邮件 UID:${uid} 已有处理标记，跳过。`);
-            return;
-        }
-
-        try {
-          const parsed = await simpleParser(buffer);
-          const simpleEmail: SimpleEmail = {
-            uid,
-            messageId: parsed.messageId || `uid-${uid}`,
-            subject: parsed.subject || '(无主题)',
-            from: parsed.from?.text || 'Unknown',
-            to: Array.isArray(parsed.to) ? parsed.to.map(t => t.text).join(', ') : (parsed.to?.text || 'Unknown'),
-            date: parsed.date || new Date(),
-            text: parsed.text || '',
-            html: parsed.html || undefined,
-            attachments: parsed.attachments.map(a => ({
-              filename: a.filename,
-              contentType: a.contentType,
-              size: a.size
-            }))
-          };
-
-          this.processEmail(simpleEmail);
-        } catch (error) {
-          console.error(`❌ 解析邮件失败 (UID: ${uid}):`, error);
-        }
-      });
-    });
-
-    f.once('error', (err) => {
-      console.error('❌ Fetch 过程中出错:', err);
-    });
-  }
-
   /**
-   * 核心业务逻辑：保存到数据库并交由 Agent 处理
+   * 启动入口：注册新邮件处理回调，并拉起所有已绑定用户的 IMAP
    */
-  private async processEmail(email: SimpleEmail) {
-    console.log(`🤖 正在处理邮件: [${email.subject}] 来自 ${email.from}`);
+  async start(): Promise<void> {
+    imapManager.registerIncomingHandler((userId, email) =>
+      this.processIncomingEmail(userId, email)
+    );
+    await imapManager.startForAllBoundUsers();
+  }
+
+  /** 单用户启动（注册或绑定邮箱后调用） */
+  async startForUser(userId: string): Promise<void> {
+    await imapManager.startForUser(userId);
+  }
+
+  // ========== 新邮件 pipeline ==========
+
+  private async processIncomingEmail(userId: string, email: SimpleEmail): Promise<void> {
+    console.log(`🤖 [user=${userId}] 处理新邮件: ${email.subject}`);
 
     try {
-        // 1. 保存到数据库
-        const saved = await databaseService.upsertEmail(this.DEFAULT_USER_ID, {
-            uid: email.uid,
-            messageId: email.messageId,
-            from: email.from,
-            to: email.to,
-            subject: email.subject,
-            body: email.text,
-            html: email.html,
-            receivedAt: email.date,
+      // 1. 入库
+      const saved = await databaseService.upsertEmail(userId, {
+        uid: email.uid,
+        messageId: email.messageId,
+        from: email.from,
+        to: email.to,
+        subject: email.subject,
+        body: email.text,
+        html: email.html,
+        receivedAt: email.date,
+      });
+
+      // 2. 先跑规则引擎；命中则跳过 Agent
+      const ruleHit = await ruleEngine.evaluate(userId, email);
+
+      let analysis;
+      let source: 'rule' | 'agent';
+
+      if (ruleHit) {
+        console.log(`📏 [user=${userId}] 命中规则 "${ruleHit.ruleName}" → category=${ruleHit.result.classification.category}`);
+        analysis = ruleHit.result;
+        source = 'rule';
+
+        // 仍要写入 DB（updateEmailAnalysisById 内含 classification upsert + AgentLog）
+        await databaseService.updateEmailAnalysisById(saved.id, userId, {
+          ...analysis,
+          duration: 0,
         });
 
-        console.log(`💾 邮件 UID:${email.uid} 已保存到数据库 (id=${saved.id})。`);
+        // 执行规则附带的副作用动作
+        await this.applyRuleSideEffects(userId, saved.id, ruleHit.sideEffects);
+      } else {
+        const result = await agentService.analyzeEmail({ userId, email });
+        analysis = result;
+        source = 'agent';
+      }
 
-        // 2. 调用 Agent 进行基础分类、重要性判断和摘要生成
-        const analysis = await agentService.analyzeEmail({
-            userId: this.DEFAULT_USER_ID,
-            email,
-        });
+      console.log(
+        `🧠 [user=${userId}] [${source}] 分类=${analysis.classification.category}, 重要性=${analysis.importance.score}/10`
+      );
 
-        console.log(
-          `🧠 Agent 分析完成: 分类=${analysis.classification.category}, 重要性=${analysis.importance.score}/10`
-        );
+      // 3. 飞书推送（按用户偏好决定阈值与高亮）
+      const user = await databaseService.getUserById(userId);
+      const prefs = (user?.preferences as any) || {};
+      const threshold = prefs.importanceThreshold ?? DEFAULT_IMPORTANCE_THRESHOLD;
+      const pushAll = prefs.pushAllEmails !== false; // 默认 true
+      const isImportant = analysis.importance.score >= threshold;
 
-        // 3. 推送飞书卡片通知
+      if (pushAll || isImportant) {
         await feishuService.pushEmailCard({
           emailId: saved.id,
           from: email.from,
@@ -271,65 +105,68 @@ export class EmailService {
           confidence: analysis.classification.confidence,
           isRead: false,
           isArchived: false,
+          openId: user?.feishuUserId || undefined,
+          isImportant,
         });
-
-        // 4. 处理完成后，打上已处理标记
-        this.markAsProcessed(email.uid);
+      }
     } catch (error) {
-        console.error(`❌ 处理邮件失败 (UID: ${email.uid}):`, error);
+      console.error(`❌ [user=${userId}] 处理邮件失败 (UID ${email.uid}):`, error);
     }
   }
 
-  private markAsProcessed(uid: number) {
-    if (!this.imap) return;
-    this.imap.addFlags(uid, [this.PROCESSED_FLAG], (err) => {
-      if (err) console.error(`❌ 标记邮件 UID:${uid} 失败:`, err);
-      else console.log(`✅ 邮件 UID:${uid} 已成功标记为处理过。`);
-    });
+  /**
+   * 规则匹配后产生的副作用（mark_read / archive / delete）
+   * 这些动作需要操作 IMAP，单独抽出来执行
+   */
+  private async applyRuleSideEffects(
+    userId: string,
+    emailId: string,
+    actions: Array<'mark_read' | 'archive' | 'delete'>
+  ) {
+    for (const a of actions) {
+      try {
+        if (a === 'mark_read') await this.markReadByEmailId(emailId, userId);
+        else if (a === 'archive') await this.archiveByEmailId(emailId, userId);
+        else if (a === 'delete') await this.deleteByEmailId(emailId, userId);
+      } catch (e: any) {
+        console.warn(`⚠️ [user=${userId}] 规则副作用 ${a} 失败:`, e.message);
+      }
+    }
   }
 
-  // ========== 飞书回调触发的公开方法 ==========
+  // ========== 被飞书回调调用的写操作（带 ownership 防御） ==========
 
-  async markReadByEmailId(emailId: string) {
-    const uid = await this.getUidByEmailIdOrThrow(emailId);
-    await this.runImapOperation((imap, done) => {
-      imap.addFlags(uid, ['\\Seen'], done);
-    });
-    console.log(`✅ 邮件 UID:${uid} 已标记为已读`);
+  async markReadByEmailId(emailId: string, expectedUserId?: string) {
+    const { mailbox, uid } = await imapManager.getMailboxForEmail(emailId, expectedUserId);
+    await mailbox.markRead(uid);
+    console.log(`✅ [user=${mailbox.userId}] UID ${uid} 已读`);
   }
 
-  async markImportantByEmailId(emailId: string) {
-    const uid = await this.getUidByEmailIdOrThrow(emailId);
-    await this.runImapOperation((imap, done) => {
-      imap.addFlags(uid, ['\\Flagged'], done);
-    });
-    console.log(`✅ 邮件 UID:${uid} 已标记为重点`);
+  async markImportantByEmailId(emailId: string, expectedUserId?: string) {
+    const { mailbox, uid } = await imapManager.getMailboxForEmail(emailId, expectedUserId);
+    await mailbox.markFlagged(uid);
+    console.log(`✅ [user=${mailbox.userId}] UID ${uid} 已标重点`);
   }
 
-  async archiveByEmailId(emailId: string) {
-    await this.ensureArchiveBox();
-    const uid = await this.getUidByEmailIdOrThrow(emailId);
-    await this.runImapOperation((imap, done) => {
-      imap.move(uid, this.ARCHIVE_BOX, done);
-    });
-    console.log(`✅ 邮件 UID:${uid} 已归档到 ${this.ARCHIVE_BOX}`);
+  async archiveByEmailId(emailId: string, expectedUserId?: string) {
+    const { mailbox, uid } = await imapManager.getMailboxForEmail(emailId, expectedUserId);
+    await mailbox.archive(uid);
+    console.log(`✅ [user=${mailbox.userId}] UID ${uid} 已归档`);
   }
 
-  async deleteByEmailId(emailId: string) {
-    const uid = await this.getUidByEmailIdOrThrow(emailId);
-    await this.runImapOperation((imap, done) => {
-      imap.addFlags(uid, ['\\Deleted'], done);
-    });
-    await this.runImapOperation((imap, done) => {
-      imap.expunge(uid, done);
-    });
-    console.log(`✅ 邮件 UID:${uid} 已删除`);
+  async deleteByEmailId(emailId: string, expectedUserId?: string) {
+    const { mailbox, uid } = await imapManager.getMailboxForEmail(emailId, expectedUserId);
+    await mailbox.deleteMail(uid);
+    console.log(`✅ [user=${mailbox.userId}] UID ${uid} 已删除`);
   }
 
-  async reanalyzeByEmailId(emailId: string) {
+  // ========== 重新分析（不操作 IMAP） ==========
+
+  async reanalyzeByEmailId(emailId: string, expectedUserId?: string) {
     const email = await databaseService.getEmailById(emailId);
-    if (!email) {
-      throw new Error(`找不到邮件 emailId=${emailId}，无法重新分析`);
+    if (!email) throw new Error(`找不到邮件 emailId=${emailId}`);
+    if (expectedUserId && email.userId !== expectedUserId) {
+      throw new Error('无权操作此邮件');
     }
 
     const simpleEmail: SimpleEmail = {
@@ -357,85 +194,6 @@ export class EmailService {
     });
 
     return { analysis, email: updatedEmail };
-  }
-
-  private archiveBoxEnsured = false;
-
-  private async ensureArchiveBox(): Promise<void> {
-    if (this.archiveBoxEnsured) return;
-
-    const folders = await this.listImapFolders();
-    const exists = folders.some(
-      (f) => f.name === this.ARCHIVE_BOX || f.path === this.ARCHIVE_BOX,
-    );
-
-    if (!exists) {
-      console.log(`📁 归档文件夹 "${this.ARCHIVE_BOX}" 不存在，正在创建...`);
-      await this.createImapFolder(this.ARCHIVE_BOX);
-      console.log(`✅ 归档文件夹 "${this.ARCHIVE_BOX}" 创建成功`);
-    }
-
-    this.archiveBoxEnsured = true;
-  }
-
-  private listImapFolders(): Promise<Array<{ name: string; path: string }>> {
-    return new Promise((resolve, reject) => {
-      if (!this.imap) {
-        return reject(new Error('IMAP 未连接'));
-      }
-      this.imap.getBoxes((err, boxes) => {
-        if (err) return reject(err);
-        resolve(this.flattenBoxes(boxes));
-      });
-    });
-  }
-
-  private flattenBoxes(boxes: any, parentPath = ''): Array<{ name: string; path: string }> {
-    const result: Array<{ name: string; path: string }> = [];
-    for (const [name, box] of Object.entries(boxes)) {
-      const fullPath = parentPath ? `${parentPath}${box.delimiter || '/'}${name}` : name;
-      result.push({ name, path: fullPath });
-      if ((box as any).children) {
-        result.push(...this.flattenBoxes((box as any).children, fullPath));
-      }
-    }
-    return result;
-  }
-
-  private createImapFolder(name: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (!this.imap) {
-        return reject(new Error('IMAP 未连接'));
-      }
-      this.imap.addBox(name, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  }
-
-  private async runImapOperation(
-    operation: (imap: Imap, done: (err?: Error | null) => void) => void
-  ): Promise<void> {
-    if (!this.imap) {
-      throw new Error('IMAP 未连接，无法执行邮箱操作');
-    }
-
-    await new Promise<void>((resolve, reject) => {
-      operation(this.imap as Imap, (err?: Error | null) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-  }
-
-  private async getUidByEmailIdOrThrow(emailId: string): Promise<number> {
-    const email = await databaseService.getEmailById(emailId);
-    if (!email) {
-      throw new Error(`找不到邮件 emailId=${emailId}`);
-    }
-
-    return email.uid;
   }
 }
 

@@ -1,20 +1,28 @@
 /**
- * 飞书 Webhook 回调路由
+ * 飞书 Webhook 回调
  *
  * POST /api/feishu/webhook
+ *   Headers:
+ *     X-Bot-Secret: <FEISHU_BOT_SHARED_SECRET>     (生产环境必填)
+ *   Body:
+ *     { action, emailId, openId, expectedCategory?, comment? }
  *
- * 接收飞书卡片按钮点击事件回调（由 email_claw_bot 转发），
- * 执行对应的邮箱和数据库操作。
+ * 防御链路：
+ *   1) X-Bot-Secret 校验，杜绝非 bot 来源请求
+ *   2) openId → userId 解析（必须已在 User.feishuUserId 绑定）
+ *   3) feishuService.handleCallback 内部还会再做 emailId ownership 校验
  */
 
 import { Router, Request, Response } from 'express';
 import { feishuService } from '../../integrations/feishu/feishuService';
+import { requireBotSecret } from '../../middleware/authMiddleware';
+import { databaseService } from '../../services/databaseService';
 
 const router = Router();
 
-router.post('/webhook', async (req: Request, res: Response) => {
+router.post('/webhook', requireBotSecret, async (req: Request, res: Response) => {
   try {
-    const { action, emailId, expectedCategory, comment } = req.body;
+    const { action, emailId, expectedCategory, comment, openId } = req.body;
 
     if (!action || !emailId) {
       return res.status(400).json({
@@ -22,30 +30,40 @@ router.post('/webhook', async (req: Request, res: Response) => {
         error: '缺少必填字段 action 或 emailId',
       });
     }
+    if (!openId) {
+      return res.status(400).json({
+        success: false,
+        error: '缺少 openId（bot 未传，无法确定操作者）',
+      });
+    }
 
-    // 同步等待业务处理完成，返回完整结果给 bot
-    // 飞书 3 秒超时由 bot 端"先返回 toast、再异步 updateCard"模式兜底，
-    // 因此这里不需要急着把 res 提前返回
+    // openId → userId
+    const user = await databaseService.getUserByFeishuOpenId(openId);
+    if (!user) {
+      return res.status(403).json({
+        success: false,
+        error: '该飞书账号未绑定 EmailClaw 用户',
+      });
+    }
+
     const result = await feishuService.handleCallback({
       action,
       emailId,
       expectedCategory,
       comment,
+      userId: user.id,
     });
 
     if (result.success) {
-      console.log(`✅ ${action} 操作成功`);
+      console.log(`✅ ${action} 成功 (user=${user.id})`);
     } else {
-      console.warn(`⚠️ ${action} 操作未完成: ${result.message}`);
+      console.warn(`⚠️ ${action} 未完成 (user=${user.id}): ${result.message}`);
     }
 
     res.status(200).json(result);
   } catch (error: any) {
     console.error('❌ 飞书 webhook 处理失败:', error);
-    res.status(500).json({
-      success: false,
-      message: `内部错误: ${error.message}`,
-    });
+    res.status(500).json({ success: false, message: `内部错误: ${error.message}` });
   }
 });
 

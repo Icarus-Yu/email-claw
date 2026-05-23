@@ -21,6 +21,7 @@ const {
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
 const DEFAULT_OPEN_ID = process.env.DEFAULT_OPEN_ID;
+const BOT_SECRET = process.env.FEISHU_BOT_SHARED_SECRET || '';
 
 const ACTION_LABELS = {
   mark_read: '已标为已读',
@@ -71,7 +72,7 @@ async function handleCardAction(data, feishuClient) {
     emailId,
     expectedCategory,
     comment,
-    openId,
+    openId: openId || DEFAULT_OPEN_ID,
     messageId,
     feishuClient,
   });
@@ -109,6 +110,7 @@ async function doBackendAndRefresh({
     emailId,
     expectedCategory,
     comment,
+    openId,
   });
 
   if (!result.success) {
@@ -156,9 +158,11 @@ async function doBackendAndRefresh({
  * 调用 email-claw 后端
  */
 async function forwardToBackend(payload) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (BOT_SECRET) headers['X-Bot-Secret'] = BOT_SECRET;
   const response = await fetch(`${BACKEND_URL}/api/feishu/webhook`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(payload),
   });
 

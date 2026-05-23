@@ -24,6 +24,7 @@ export interface FeishuEmailNotify {
   isRead: boolean;
   isArchived: boolean;
   isDeleted?: boolean;
+  isImportant?: boolean; // 是否触发重要性高亮（决定 header 颜色和前缀）
   openId?: string; // 目标用户 open_id，缺省使用机器人默认用户
 }
 
@@ -85,89 +86,71 @@ export class FeishuService {
    *
    * @returns 处理结果描述
    */
-  async handleCallback(callback: FeishuCardCallback): Promise<FeishuCallbackResult> {
-    const { action, emailId, expectedCategory, comment } = callback;
+  async handleCallback(callback: FeishuCardCallback & { userId: string }): Promise<FeishuCallbackResult> {
+    const { action, emailId, expectedCategory, comment, userId } = callback;
 
-    console.log(`📥 收到飞书回调: action=${action}, emailId=${emailId}`);
+    console.log(`📥 飞书回调: action=${action}, emailId=${emailId}, userId=${userId}`);
 
-    // 动态导入 databaseService 避免循环依赖
     const { databaseService } = await import('../../services/databaseService');
     const { emailService } = await import('../../services/emailService');
 
+    // ⛑ 防御性 ownership 校验：emailId 必须属于该 userId
+    try {
+      await databaseService.assertEmailOwnership(emailId, userId);
+    } catch (e: any) {
+      console.warn(`🚫 越权拦截: user=${userId} emailId=${emailId}: ${e.message}`);
+      return { success: false, message: e.message };
+    }
+
     switch (action) {
       case 'mark_read':
-        return this.handleMarkRead(emailId, databaseService, emailService);
-
+        return this.handleMarkRead(emailId, userId, databaseService, emailService);
       case 'mark_important':
-        return this.handleMarkImportant(emailId, databaseService, emailService);
-
+        return this.handleMarkImportant(emailId, userId, databaseService, emailService);
       case 'archive':
-        return this.handleArchive(emailId, databaseService, emailService);
-
+        return this.handleArchive(emailId, userId, databaseService, emailService);
       case 'delete':
-        return this.handleDelete(emailId, databaseService, emailService);
-
+        return this.handleDelete(emailId, userId, databaseService, emailService);
       case 'feedback_correct':
         return this.handleFeedbackCorrect(emailId, databaseService);
-
       case 'feedback_wrong':
         return this.handleFeedbackWrong(emailId, expectedCategory, comment, databaseService);
-
       case 'view_detail':
         return this.handleViewDetail(emailId, databaseService);
-
       case 'reanalyze':
-        return this.handleReanalyze(emailId, databaseService, emailService);
-
+        return this.handleReanalyze(emailId, userId, databaseService, emailService);
       default:
-        console.warn(`⚠️ 未知 action: ${action}`);
         return { success: false, message: `未知操作: ${action}` };
     }
   }
 
   // ========== 各 action 处理逻辑 ==========
 
-  private async handleMarkRead(
-    emailId: string,
-    db: any,
-    emailSvc: any
-  ): Promise<FeishuCallbackResult> {
-    await emailSvc.markReadByEmailId(emailId);
-    const email = await db.markEmailRead(emailId);
-    const fullEmail = await db.getEmailById(email.id);
+  private async handleMarkRead(emailId: string, userId: string, db: any, emailSvc: any): Promise<FeishuCallbackResult> {
+    await emailSvc.markReadByEmailId(emailId, userId);
+    await db.markEmailRead(emailId);
+    const fullEmail = await db.getEmailById(emailId);
     return { success: true, action: 'mark_read', message: '已标记为已读', email: this.toNotifyEmail(fullEmail) };
   }
 
-  private async handleMarkImportant(
-    emailId: string,
-    db: any,
-    emailSvc: any
-  ): Promise<FeishuCallbackResult> {
-    await emailSvc.markImportantByEmailId(emailId);
-    const email = await db.markEmailImportant(emailId);
-    const fullEmail = await db.getEmailById(email.id);
+  private async handleMarkImportant(emailId: string, userId: string, db: any, emailSvc: any): Promise<FeishuCallbackResult> {
+    await emailSvc.markImportantByEmailId(emailId, userId);
+    await db.markEmailImportant(emailId);
+    const fullEmail = await db.getEmailById(emailId);
     return { success: true, action: 'mark_important', message: '已标为重点', email: this.toNotifyEmail(fullEmail) };
   }
 
-  private async handleArchive(
-    emailId: string,
-    db: any,
-    emailSvc: any
-  ): Promise<FeishuCallbackResult> {
-    await emailSvc.archiveByEmailId(emailId);
-    const email = await db.archiveEmail(emailId);
-    const fullEmail = await db.getEmailById(email.id);
+  private async handleArchive(emailId: string, userId: string, db: any, emailSvc: any): Promise<FeishuCallbackResult> {
+    await emailSvc.archiveByEmailId(emailId, userId);
+    await db.archiveEmail(emailId);
+    const fullEmail = await db.getEmailById(emailId);
     return { success: true, action: 'archive', message: '已归档', email: this.toNotifyEmail(fullEmail) };
   }
 
-  private async handleDelete(
-    emailId: string,
-    db: any,
-    emailSvc: any
-  ): Promise<FeishuCallbackResult> {
-    await emailSvc.deleteByEmailId(emailId);
-    const email = await db.markEmailDeleted(emailId);
-    const fullEmail = await db.getEmailById(email.id);
+  private async handleDelete(emailId: string, userId: string, db: any, emailSvc: any): Promise<FeishuCallbackResult> {
+    await emailSvc.deleteByEmailId(emailId, userId);
+    await db.markEmailDeleted(emailId);
+    const fullEmail = await db.getEmailById(emailId);
     return { success: true, action: 'delete', message: '已删除', email: this.toNotifyEmail(fullEmail) };
   }
 
@@ -232,11 +215,12 @@ export class FeishuService {
 
   private async handleReanalyze(
     emailId: string,
+    userId: string,
     db: any,
     emailSvc: any
   ): Promise<FeishuCallbackResult> {
     try {
-      const result = await emailSvc.reanalyzeByEmailId(emailId);
+      const result = await emailSvc.reanalyzeByEmailId(emailId, userId);
       return {
         success: true,
         action: 'reanalyze',
@@ -250,6 +234,7 @@ export class FeishuService {
 
   private toNotifyEmail(email: any): FeishuEmailNotify {
     const classification = email?.classification;
+    const importance = email.importance ?? 0;
 
     return {
       emailId: email.id,
@@ -258,13 +243,14 @@ export class FeishuService {
       subject: email.subject,
       receivedAt: email.receivedAt instanceof Date ? email.receivedAt.toISOString() : email.receivedAt,
       category: email.category || classification?.category || 'other',
-      importance: email.importance ?? 0,
+      importance,
       summary: email.summary || this.extractSummary(classification?.reasoning) || '暂无摘要',
       classificationReasoning: classification?.reasoning || '',
       confidence: classification?.confidence ?? 0,
       isRead: email.isRead,
       isArchived: email.isArchived,
       isDeleted: email.isDeleted,
+      isImportant: importance >= 7,
     };
   }
 

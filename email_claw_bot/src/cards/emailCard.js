@@ -31,14 +31,17 @@ const CATEGORY_LABELS = {
  * @returns {object} 飞书卡片 JSON
  */
 function buildEmailCard(email) {
-  const color = CATEGORY_COLORS[email.category] || 'grey';
+  const baseColor = CATEGORY_COLORS[email.category] || 'grey';
+  // 重要邮件强制红色 header + 标题加 🔥 前缀
+  const color = email.isImportant ? 'red' : baseColor;
+  const titlePrefix = email.isImportant ? '🔥 ' : '';
   const categoryLabel = CATEGORY_LABELS[email.category] || email.category;
   const canOperate = !email.isDeleted;
 
   return {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: email.subject || '(无主题)' },
+      title: { tag: 'plain_text', content: `${titlePrefix}${email.subject || '(无主题)'}` },
       template: color,
     },
     elements: [
