@@ -96,18 +96,25 @@ export class EmailService {
   private initListeners() {
     if (!this.imap) return;
 
-    this.imap.once('ready', () => {
+    this.imap.once('ready', async () => {
       this.isConnecting = false;
       console.log('✅ IMAP 连接成功，鉴权通过！');
-      
+
+      // 确保归档文件夹存在（CREATE 命令必须在 selected 状态之前执行）
+      try {
+        await this.ensureArchiveBox();
+      } catch (err: any) {
+        console.error('⚠️ 归档文件夹检查失败:', err.message);
+      }
+
       this.imap?.openBox('INBOX', false, (err, box) => {
         if (err) {
           console.error('❌ 打开 INBOX 失败:', err);
           return;
         }
-        
+
         console.log(`📂 成功打开 INBOX，当前共有 ${box.messages.total} 封邮件。`);
-        
+
         // 初次连接时，可以先扫描未标记过的历史邮件
         this.scanUnprocessedEmails();
 
@@ -300,6 +307,7 @@ export class EmailService {
   }
 
   async archiveByEmailId(emailId: string) {
+    await this.ensureArchiveBox();
     const uid = await this.getUidByEmailIdOrThrow(emailId);
     await this.runImapOperation((imap, done) => {
       imap.move(uid, this.ARCHIVE_BOX, done);
@@ -349,6 +357,61 @@ export class EmailService {
     });
 
     return { analysis, email: updatedEmail };
+  }
+
+  private archiveBoxEnsured = false;
+
+  private async ensureArchiveBox(): Promise<void> {
+    if (this.archiveBoxEnsured) return;
+
+    const folders = await this.listImapFolders();
+    const exists = folders.some(
+      (f) => f.name === this.ARCHIVE_BOX || f.path === this.ARCHIVE_BOX,
+    );
+
+    if (!exists) {
+      console.log(`📁 归档文件夹 "${this.ARCHIVE_BOX}" 不存在，正在创建...`);
+      await this.createImapFolder(this.ARCHIVE_BOX);
+      console.log(`✅ 归档文件夹 "${this.ARCHIVE_BOX}" 创建成功`);
+    }
+
+    this.archiveBoxEnsured = true;
+  }
+
+  private listImapFolders(): Promise<Array<{ name: string; path: string }>> {
+    return new Promise((resolve, reject) => {
+      if (!this.imap) {
+        return reject(new Error('IMAP 未连接'));
+      }
+      this.imap.getBoxes((err, boxes) => {
+        if (err) return reject(err);
+        resolve(this.flattenBoxes(boxes));
+      });
+    });
+  }
+
+  private flattenBoxes(boxes: any, parentPath = ''): Array<{ name: string; path: string }> {
+    const result: Array<{ name: string; path: string }> = [];
+    for (const [name, box] of Object.entries(boxes)) {
+      const fullPath = parentPath ? `${parentPath}${box.delimiter || '/'}${name}` : name;
+      result.push({ name, path: fullPath });
+      if ((box as any).children) {
+        result.push(...this.flattenBoxes((box as any).children, fullPath));
+      }
+    }
+    return result;
+  }
+
+  private createImapFolder(name: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!this.imap) {
+        return reject(new Error('IMAP 未连接'));
+      }
+      this.imap.addBox(name, (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    });
   }
 
   private async runImapOperation(
