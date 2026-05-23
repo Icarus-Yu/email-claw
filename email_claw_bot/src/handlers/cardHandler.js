@@ -1,144 +1,159 @@
 /**
  * 卡片按钮点击事件处理器
  *
- * 处理用户在飞书卡片上的按钮点击：
- * 1. 直接处理简单反馈（分类正确/错误）
- * 2. 将需要后端操作的事件转发给 email-claw 后端
+ * 设计：
+ * 1. 飞书 card.action.trigger 回调有 ~3 秒超时，超时会显示红色错误。
+ * 2. 后端真实业务（IMAP / DB）可能慢于 3 秒。
+ * 3. 因此本 handler 采用"先回 toast，再异步刷新卡片"模式：
+ *    - 同步返回一个轻量 toast（"处理中..."）让飞书停止倒计时；
+ *    - 在后台 await 后端处理完，再用 im.message.patch 主动更新原卡片；
+ *    - "查看详情"则在后台 sendCard 新发一张详情卡片，保留原邮件卡片的操作按钮。
+ *
+ * 唯一的同步分支是"分类错误"首次点击：需要立刻把分类选择卡片渲染出来，
+ * 这一步不依赖后端，直接同步返回 card 即可。
  */
 
-const { buildEmailCard, buildCategoryPickerCard, buildEmailDetailCard } = require('../cards/emailCard');
+const {
+  buildEmailCard,
+  buildCategoryPickerCard,
+  buildEmailDetailCard,
+} = require('../cards/emailCard');
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+const DEFAULT_OPEN_ID = process.env.DEFAULT_OPEN_ID;
+
+const ACTION_LABELS = {
+  mark_read: '已标为已读',
+  mark_important: '已标为重点',
+  archive: '已归档',
+  delete: '已删除',
+  feedback_correct: '反馈已记录',
+  feedback_wrong: '纠错反馈已记录',
+  reanalyze: '重新分析已完成',
+  view_detail: '详情已获取',
+};
 
 /**
  * 处理卡片按钮点击回调
  *
- * @param {object} data - 飞书传入的卡片事件数据
+ * @param {object} data - 飞书 card.action.trigger 事件数据
  * @param {object} feishuClient - 飞书客户端实例
- * @returns {Promise<object>} 飞书期望的响应（toast + 可选 card 更新）
+ * @returns {Promise<object>} 同步给飞书的响应（toast 或 card）
  */
 async function handleCardAction(data, feishuClient) {
   const {
-    operator: { open_id },
-    action: { value, form_value = {} },
-  } = data;
+    operator: { open_id: openId } = {},
+    action: { value = {} } = {},
+  } = data || {};
 
   const { action, emailId, expectedCategory, comment } = value;
+  const messageId = extractMessageId(data);
 
-  console.log(`📨 收到卡片按钮事件: action=${action}, emailId=${emailId}, open_id=${open_id}`);
+  console.log(
+    `📨 卡片按钮: action=${action}, emailId=${emailId}, openId=${openId}, messageId=${messageId}`
+  );
 
-  switch (action) {
-    // ========== 后端正向操作（需要操作邮箱） ==========
-    case 'mark_read':
-    case 'mark_important':
-    case 'archive':
-    case 'delete':
-    case 'reanalyze':
-    case 'view_detail':
-      return handleBackendAction(action, emailId, open_id, feishuClient);
-
-    // ========== AI 反馈操作 ==========
-    case 'feedback_correct':
-      return handleBackendAction(action, emailId, open_id, feishuClient);
-
-    case 'feedback_wrong':
-      // 如果用户已经选择了正确分类（从分类选择卡片点击）
-      if (expectedCategory) {
-        return handleBackendAction(action, emailId, open_id, feishuClient, { expectedCategory, comment });
-      }
-      // 用户首次点击"分类错误"，返回分类选择卡片
-      return {
-        toast: {
-          type: 'info',
-          content: '请在下方选择正确的邮件分类',
-          i18n: {
-            zh_cn: '请在下方选择正确的邮件分类',
-            en_us: 'Please select the correct category below',
-          },
-        },
-        card: buildCategoryPickerCard(emailId),
-      };
-
-    default:
-      console.warn(`⚠️ 未知 action: ${action}`);
-      return {
-        toast: {
-          type: 'error',
-          content: `未知操作: ${action}`,
-          i18n: {
-            zh_cn: `未知操作: ${action}`,
-            en_us: `Unknown action: ${action}`,
-          },
-        },
-      };
+  // 分类错误首次点击：同步返回分类选择卡片，无需后端
+  if (action === 'feedback_wrong' && !expectedCategory) {
+    return {
+      toast: makeToast('info', '请在下方选择正确的邮件分类'),
+      card: buildCategoryPickerCard(emailId),
+    };
   }
+
+  if (!action || !emailId) {
+    return { toast: makeToast('error', '缺少 action 或 emailId') };
+  }
+
+  // 其他所有 action：先 toast，再异步处理 + 刷新卡片
+  scheduleBackendAndRefresh({
+    action,
+    emailId,
+    expectedCategory,
+    comment,
+    openId,
+    messageId,
+    feishuClient,
+  });
+
+  return { toast: makeToast('info', '处理中...') };
 }
 
 /**
- * 处理需要后端执行的操作
- * 将请求转发给后端，并根据后端返回更新卡片
+ * 后台：调用后端 → 根据 action 决定是更新原卡片还是发送新卡片
  */
-async function handleBackendAction(action, emailId, openId, feishuClient, extraPayload = {}) {
-  try {
-    const result = await forwardToBackend({ action, emailId, ...extraPayload });
-    console.log(`✅ 后端处理成功: action=${action}, result=`, result);
+function scheduleBackendAndRefresh(ctx) {
+  // 不 await，立即把控制权还给 handleCardAction
+  doBackendAndRefresh(ctx).catch((error) => {
+    console.error(`❌ 后台刷新失败: action=${ctx.action}`, error);
+    // 尝试给用户一个失败提示（不阻塞）
+    sendFallbackText(
+      ctx.feishuClient,
+      ctx.openId,
+      `操作失败 (${ctx.action}): ${error.message}`
+    ).catch(() => {});
+  });
+}
 
-    const actionLabels = {
-      mark_read: '已标为已读',
-      mark_important: '已标为重点',
-      archive: '已归档',
-      delete: '已删除',
-      feedback_correct: '反馈已记录',
-      feedback_wrong: '纠错反馈已记录',
-      reanalyze: '重新分析已完成',
-      view_detail: '详情已获取',
-    };
+async function doBackendAndRefresh({
+  action,
+  emailId,
+  expectedCategory,
+  comment,
+  openId,
+  messageId,
+  feishuClient,
+}) {
+  const result = await forwardToBackend({
+    action,
+    emailId,
+    expectedCategory,
+    comment,
+  });
 
-    if (action === 'view_detail') {
-      return {
-        toast: {
-          type: 'success',
-          content: result.message || actionLabels[action],
-          i18n: {
-            zh_cn: result.message || actionLabels[action],
-            en_us: 'Email detail loaded.',
-          },
-        },
-        card: buildEmailDetailCard(result.detail),
-      };
-    }
-
-    return {
-      toast: {
-        type: 'success',
-        content: result.message || actionLabels[action] || `操作完成: ${action}`,
-        i18n: {
-          zh_cn: result.message || actionLabels[action] || `操作完成: ${action}`,
-          en_us: `Action completed: ${action}`,
-        },
-      },
-      ...(result.email ? { card: buildEmailCard(result.email) } : {}),
-    };
-  } catch (error) {
-    console.error(`❌ 后端处理失败: action=${action}`, error.message);
-    return {
-      toast: {
-        type: 'error',
-        content: `操作失败: ${error.message}`,
-        i18n: {
-          zh_cn: `操作失败: ${error.message}`,
-          en_us: `Action failed: ${error.message}`,
-        },
-      },
-    };
+  if (!result.success) {
+    console.warn(`⚠️ 后端返回失败: ${result.message}`);
+    await sendFallbackText(
+      feishuClient,
+      openId,
+      `操作未完成 (${action}): ${result.message || '未知原因'}`
+    );
+    return;
   }
+
+  console.log(`✅ 后端成功: action=${action}`);
+
+  // 查看详情：新发一张详情卡片，保留原邮件卡片
+  if (action === 'view_detail') {
+    if (!result.detail) {
+      throw new Error('后端未返回 detail');
+    }
+    const detailCard = buildEmailDetailCard(result.detail);
+    await feishuClient.sendCard('open_id', openId || DEFAULT_OPEN_ID, detailCard);
+    return;
+  }
+
+  // 其余 action：原地刷新邮件卡片
+  if (!result.email) {
+    console.warn(`⚠️ 后端未返回 email，跳过卡片刷新: action=${action}`);
+    return;
+  }
+
+  if (!messageId) {
+    console.warn('⚠️ 事件中缺少 messageId，无法 patch 原卡片，改为新发一张');
+    await feishuClient.sendCard(
+      'open_id',
+      openId || DEFAULT_OPEN_ID,
+      buildEmailCard(result.email)
+    );
+    return;
+  }
+
+  await feishuClient.updateCard(messageId, buildEmailCard(result.email));
 }
 
 /**
- * 将操作请求转发给 email-claw 后端
- *
- * @param {object} payload - { action, emailId, ... }
- * @returns {Promise<object>} 后端响应
+ * 调用 email-claw 后端
  */
 async function forwardToBackend(payload) {
   const response = await fetch(`${BACKEND_URL}/api/feishu/webhook`, {
@@ -149,10 +164,39 @@ async function forwardToBackend(payload) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Backend returned ${response.status}: ${text}`);
+    throw new Error(`Backend ${response.status}: ${text}`);
   }
 
   return response.json();
 }
 
-module.exports = { handleCardAction, forwardToBackend };
+/**
+ * 从飞书事件 payload 中尽量稳健地取出原卡片消息 ID
+ * 不同 SDK 版本 / 事件结构字段名略有差异
+ */
+function extractMessageId(data) {
+  if (!data) return undefined;
+  return (
+    data.context?.open_message_id ||
+    data.open_message_id ||
+    data.message_id ||
+    data.event?.context?.open_message_id ||
+    undefined
+  );
+}
+
+function makeToast(type, content) {
+  return {
+    type,
+    content,
+    i18n: { zh_cn: content, en_us: content },
+  };
+}
+
+async function sendFallbackText(feishuClient, openId, text) {
+  const target = openId || DEFAULT_OPEN_ID;
+  if (!target) return;
+  await feishuClient.sendText('open_id', target, text);
+}
+
+module.exports = { handleCardAction, forwardToBackend, ACTION_LABELS };
