@@ -25,12 +25,39 @@ export class OpenClawClient {
 
   async analyzeEmail(email: SimpleEmail): Promise<EmailAgentResult> {
     const prompt = this.buildPrompt(email);
+
+    // DeepSeek 等模型偶发会无视指令（包 markdown 围栏 / 输出非法 JSON）。
+    // 这是无状态分析，安全可重试：失败时换个 session key 再跑一次，
+    // 两次都失败才抛出，由 agentService 回退本地规则。
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const stdout = await this.runAgentOnce(email, prompt);
+        const raw = this.parseJson(stdout);
+        return this.normalizeResult(raw);
+      } catch (error) {
+        lastError = error;
+        if (attempt === 0) {
+          console.warn('⚠️ OpenClaw 首次解析失败，重试一次:', (error as Error)?.message);
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  private async runAgentOnce(email: SimpleEmail, prompt: string): Promise<string> {
+    // 每封邮件用独立 session key：分析是无状态的，且后端会并发拉起多个
+    // `--local` 子进程，共用默认会话会触发 EmbeddedAttemptSessionTakeoverError
+    // （多个进程抢同一个 session 文件锁）。唯一 session key 让它们彼此隔离。
+    const sessionKey = `email-${email.uid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const { stdout } = await execFileAsync(
       this.command,
       [
         'agent',
         '--agent',
         this.agentId,
+        '--session-key',
+        sessionKey,
         '--message',
         prompt,
         '--json',
@@ -42,14 +69,14 @@ export class OpenClawClient {
       }
     );
 
-    const raw = this.parseJson(stdout);
-    return this.normalizeResult(raw);
+    return stdout;
   }
 
   private buildPrompt(email: SimpleEmail): string {
     return [
       '请作为 EmailClaw 邮件分析 Agent 分析下面这封邮件。',
-      '你必须只返回 JSON，不要返回 Markdown 或解释文字。',
+      '你必须只返回一个合法的 JSON 对象，不要返回 Markdown 代码块、围栏(```)或任何解释文字。',
+      '字符串值中若包含双引号或换行，必须正确转义，确保整段可被 JSON.parse 直接解析。',
       'JSON 字段格式如下：',
       '{"category":"work|personal|shopping|marketing|spam|other","confidence":0.8,"classificationReasoning":"...","importance":7,"importanceReasoning":"...","summary":"..."}',
       '',
@@ -68,12 +95,37 @@ export class OpenClawClient {
 
   private parseJson(output: string): OpenClawRawResult {
     const trimmed = output.trim();
+
+    // `openclaw agent --json` 返回信封：{ payloads: [{ text }], meta }
+    // 真正的分析 JSON 在 payloads[0].text 里，需要先拆出来再解析。
+    let inner = trimmed;
     try {
-      return JSON.parse(trimmed);
+      const envelope = JSON.parse(trimmed);
+      if (envelope && Array.isArray(envelope.payloads)) {
+        inner = envelope.payloads
+          .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
+          .join('\n')
+          .trim();
+      } else if (envelope && typeof envelope === 'object' && 'category' in envelope) {
+        // 兼容：万一某个版本直接返回了裸分析对象
+        return envelope as OpenClawRawResult;
+      }
     } catch {
-      const match = trimmed.match(/\{[\s\S]*\}/);
+      // stdout 不是合法 JSON 信封，按原始文本继续走下面的兜底解析
+    }
+
+    // 模型偶尔无视指令把 JSON 包进 ```json ... ``` 围栏，先剥掉
+    inner = inner
+      .replace(/^\s*```(?:json)?\s*/i, '')
+      .replace(/\s*```\s*$/i, '')
+      .trim();
+
+    try {
+      return JSON.parse(inner);
+    } catch {
+      const match = inner.match(/\{[\s\S]*\}/);
       if (!match) {
-        throw new Error(`OpenClaw did not return JSON: ${trimmed.slice(0, 300)}`);
+        throw new Error(`OpenClaw did not return JSON: ${inner.slice(0, 300)}`);
       }
 
       return JSON.parse(match[0]);
