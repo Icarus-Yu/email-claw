@@ -68,6 +68,9 @@ export class UserMailbox {
   private archiveBoxEnsured = false;
   private stopped = false;
   private readonly archiveBox: string;
+  private pollTimer: NodeJS.Timeout | null = null;
+  /** IDLE 不靠谱时的兜底轮询间隔（毫秒） */
+  private readonly POLL_INTERVAL_MS = 30_000;
 
   constructor(
     public readonly userId: string,
@@ -102,11 +105,27 @@ export class UserMailbox {
 
   async disconnect(): Promise<void> {
     this.stopped = true;
+    this.stopPolling();
     if (!this.imap) return;
     try {
       this.imap.end();
     } catch {}
     this.imap = null;
+  }
+
+  private startPolling() {
+    if (this.pollTimer) return;
+    this.pollTimer = setInterval(() => {
+      if (this.stopped || !this.imap) return;
+      this.scanUnprocessedEmails();
+    }, this.POLL_INTERVAL_MS);
+  }
+
+  private stopPolling() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
   }
 
   private initListeners() {
@@ -132,6 +151,8 @@ export class UserMailbox {
         this.imap?.on('mail', () => {
           setTimeout(() => this.scanUnprocessedEmails(), 1000);
         });
+        // 兜底轮询（应对 QQ 等不可靠的 IMAP IDLE 推送）
+        this.startPolling();
       });
     });
 
@@ -144,6 +165,7 @@ export class UserMailbox {
     this.imap.once('end', () => {
       this.isConnecting = false;
       this.imap = null;
+      this.stopPolling();
       if (this.stopped) return;
       console.log(`⚠️ [user=${this.userId}] IMAP 断开，准备重连`);
       this.scheduleReconnect();

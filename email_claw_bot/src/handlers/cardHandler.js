@@ -34,6 +34,17 @@ const ACTION_LABELS = {
   view_detail: '详情已获取',
 };
 
+// 操作成功后给用户的简短确认消息（view_detail 已经新发卡片，无需重复提示）
+const SUCCESS_NOTIFICATIONS = {
+  mark_read: '✅ 已标为已读',
+  mark_important: '⭐ 已标为重点',
+  archive: '📦 已归档',
+  delete: '🗑 邮件已删除',
+  feedback_correct: '👍 已记录"分类正确"反馈',
+  feedback_wrong: '✏️ 已记录纠错反馈',
+  reanalyze: '🔄 已重新分析',
+};
+
 /**
  * 处理卡片按钮点击回调
  *
@@ -125,7 +136,7 @@ async function doBackendAndRefresh({
 
   console.log(`✅ 后端成功: action=${action}`);
 
-  // 查看详情：新发一张详情卡片，保留原邮件卡片
+  // 查看详情：新发一张详情卡片，保留原邮件卡片（不再额外发文本，详情卡片本身就是反馈）
   if (action === 'view_detail') {
     if (!result.detail) {
       throw new Error('后端未返回 detail');
@@ -136,22 +147,36 @@ async function doBackendAndRefresh({
   }
 
   // 其余 action：原地刷新邮件卡片
-  if (!result.email) {
+  if (result.email) {
+    if (messageId) {
+      await feishuClient.updateCard(messageId, buildEmailCard(result.email));
+    } else {
+      console.warn('⚠️ 事件中缺少 messageId，无法 patch 原卡片，改为新发一张');
+      await feishuClient.sendCard(
+        'open_id',
+        openId || DEFAULT_OPEN_ID,
+        buildEmailCard(result.email)
+      );
+    }
+  } else {
     console.warn(`⚠️ 后端未返回 email，跳过卡片刷新: action=${action}`);
-    return;
   }
 
-  if (!messageId) {
-    console.warn('⚠️ 事件中缺少 messageId，无法 patch 原卡片，改为新发一张');
-    await feishuClient.sendCard(
-      'open_id',
-      openId || DEFAULT_OPEN_ID,
-      buildEmailCard(result.email)
-    );
-    return;
+  // 给用户一条简短的确认消息（带邮件主题，便于多卡片场景区分）
+  const note = SUCCESS_NOTIFICATIONS[action];
+  if (note) {
+    const subject = result.email?.subject ? `「${truncate(result.email.subject, 30)}」` : '';
+    await sendFallbackText(
+      feishuClient,
+      openId,
+      `${note}${subject ? ' ' + subject : ''}`
+    ).catch((e) => console.warn('⚠️ 发送确认消息失败:', e.message));
   }
+}
 
-  await feishuClient.updateCard(messageId, buildEmailCard(result.email));
+function truncate(s, n) {
+  if (!s) return '';
+  return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
 /**
