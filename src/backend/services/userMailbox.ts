@@ -71,6 +71,10 @@ export class UserMailbox {
   private pollTimer: NodeJS.Timeout | null = null;
   /** IDLE 不靠谱时的兜底轮询间隔（毫秒） */
   private readonly POLL_INTERVAL_MS = 30_000;
+  /** 正在处理 / 已处理的 UID，内存级去重，挡住 CLAWED 标记写入前的并发重复扫描 */
+  private readonly claimedUids = new Set<number>();
+  /** 扫描重入锁，避免多个触发源同时跑 search/fetch */
+  private scanning = false;
 
   constructor(
     public readonly userId: string,
@@ -180,8 +184,10 @@ export class UserMailbox {
   // ===== 邮件抓取 =====
 
   private scanUnprocessedEmails() {
-    if (!this.imap) return;
+    if (!this.imap || this.scanning) return;
+    this.scanning = true;
     this.imap.search(['UNSEEN'], (err, uids) => {
+      this.scanning = false;
       if (err) {
         console.error(`❌ [user=${this.userId}] 搜索失败:`, err);
         return;
@@ -192,7 +198,11 @@ export class UserMailbox {
 
   private fetchEmailsByUids(uids: number[]) {
     if (!this.imap || uids.length === 0) return;
-    const f = this.imap.fetch(uids, { bodies: '', struct: true });
+    // 内存级去重：只 fetch 尚未占用的 UID，并立刻占位，挡住 CLAWED 标记写入前的并发重复
+    const fresh = uids.filter((u) => !this.claimedUids.has(u));
+    if (fresh.length === 0) return;
+    fresh.forEach((u) => this.claimedUids.add(u));
+    const f = this.imap.fetch(fresh, { bodies: '', struct: true });
 
     f.on('message', (msg) => {
       let buffer = '';
@@ -211,6 +221,7 @@ export class UserMailbox {
           flags.includes(PROCESSED_FLAG) ||
           flags.includes(`\\${PROCESSED_FLAG}`)
         ) {
+          // 服务器侧已标记处理过：保留占用，不再重复处理
           return;
         }
         try {
@@ -235,6 +246,8 @@ export class UserMailbox {
           await this.deps.onIncomingEmail(this.userId, simple);
           this.markProcessed(uid);
         } catch (e) {
+          // 处理失败：释放占用，让后续轮询可以重试这封邮件
+          this.claimedUids.delete(uid);
           console.error(`❌ [user=${this.userId}] 解析 UID ${uid} 失败:`, e);
         }
       });
