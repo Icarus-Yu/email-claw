@@ -55,6 +55,13 @@ export class EmailService {
         receivedAt: email.date,
       });
 
+      // 1.5 持久化去重：已处理过的邮件直接跳过，避免重启后重复发卡。
+      // （QQ 等邮箱不持久化自定义 IMAP 关键字，故以 DB 的 notifiedAt 为准）
+      if (saved.notifiedAt) {
+        console.log(`⏭️ [user=${userId}] 邮件已处理过(UID ${email.uid})，跳过`);
+        return;
+      }
+
       // 2. 先跑规则引擎；命中则跳过 Agent
       const ruleHit = await ruleEngine.evaluate(userId, email);
 
@@ -91,6 +98,7 @@ export class EmailService {
       const pushAll = prefs.pushAllEmails !== false; // 默认 true
       const isImportant = analysis.importance.score >= threshold;
 
+      let pushed = false;
       if (pushAll || isImportant) {
         await feishuService.pushEmailCard({
           emailId: saved.id,
@@ -108,6 +116,14 @@ export class EmailService {
           openId: user?.feishuUserId || undefined,
           isImportant,
         });
+        pushed = true;
+      }
+
+      // 4. 标记已处理：无论是否推送都落 notifiedAt，重启后不再重复处理/发卡。
+      //    推送失败会在上面抛错进入 catch，不会执行到这里，从而保留重试机会。
+      await databaseService.markNotified(saved.id);
+      if (!pushed) {
+        console.log(`🔕 [user=${userId}] 未达推送阈值，仅标记已处理(UID ${email.uid})`);
       }
     } catch (error) {
       console.error(`❌ [user=${userId}] 处理邮件失败 (UID ${email.uid}):`, error);

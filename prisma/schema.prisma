@@ -46,6 +46,7 @@ model Email {
   isRead         Boolean         @default(false)
   isArchived     Boolean         @default(false)
   isDeleted      Boolean         @default(false)
+  notifiedAt     DateTime? // 已完成处理/飞书推送决策的时间，用于跨重启持久化去重
   receivedAt     DateTime
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt

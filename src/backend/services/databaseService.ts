@@ -33,6 +33,17 @@ export class DatabaseService {
   }
 
   /**
+   * 标记邮件已完成处理（飞书推送决策已做出），用于跨重启持久化去重。
+   * QQ 等邮箱不持久化自定义 IMAP 关键字，故去重以 DB 为准。
+   */
+  async markNotified(emailId: string) {
+    return prisma.email.update({
+      where: { id: emailId },
+      data: { notifiedAt: new Date() },
+    });
+  }
+
+  /**
    * 保存 Agent 对邮件的分析结果
    */
   async saveEmailAnalysis(
