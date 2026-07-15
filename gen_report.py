@@ -10,8 +10,8 @@ from docx.oxml import OxmlElement
 from docx.enum.text import WD_BREAK, WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 
-TEMPLATE = "计算机综合项目实践实验报告模板.docx"
-OUTPUT = "EmailClaw_实验报告.docx"
+TEMPLATE = "docs/reports/计算机综合项目实践实验报告模板.docx"
+OUTPUT = "docs/reports/EmailClaw_实验报告.docx"
 
 doc = docx.Document(TEMPLATE)
 body = doc.element.body

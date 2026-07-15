@@ -8,8 +8,8 @@ from docx.shared import Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 
-SRC = "EmailClaw_实验报告v1.docx"
-OUT = "EmailClaw_实验报告v1_配图版.docx"
+SRC = "docs/reports/EmailClaw_实验报告v1.docx"
+OUT = "docs/reports/EmailClaw_实验报告v1_配图版.docx"
 
 # 按 caption 关键字映射到图片
 MAP = [

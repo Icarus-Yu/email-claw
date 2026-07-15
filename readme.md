@@ -94,6 +94,11 @@ IMAP 邮箱（每个用户独立长连接）
 ├── prisma/
 │   ├── schema.prisma                          # 数据模型（User / Email / Classification / Rule / Contact / AgentLog）
 │   └── migrations/                            # 数据库迁移
+├── docs/
+│   ├── project/                               # 阶段文档、需求规格、选题建组报告
+│   ├── integration/                           # 飞书 / OpenClaw 接入文档
+│   ├── reports/                               # 实验报告模板、团队报告、个人报告
+│   └── README.md                              # 文档索引
 ├── .env.example                               # 完整环境变量模板
 └── dist/                                      # TypeScript 编译产物
 ```
